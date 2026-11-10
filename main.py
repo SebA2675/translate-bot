@@ -82,7 +82,7 @@ class LanguageSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         code = self.values[0]
         rows = run_db(
-            "SELECT text FROM announcements WHERE message_id = ?",
+            "SELECT text, languages FROM announcements WHERE message_id = ?",
             (interaction.message.id,),
         )
         if not rows:
@@ -90,8 +90,10 @@ class LanguageSelect(discord.ui.Select):
                 "Sorry, I can't find this announcement anymore.", ephemeral=True
             )
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        translated = await translate(rows[0][0], code)
+        text, langs_json = rows[0]
+        # reset the dropdown so the same language can be picked again
+        await interaction.response.edit_message(view=TranslateView(json.loads(langs_json)))
+        translated = await translate(text, code)
         name, flag = LANG_BY_CODE[code]
         await interaction.followup.send(f"{flag} **{name}**\n\n{translated}", ephemeral=True)
 
@@ -126,9 +128,8 @@ class PickLanguagesView(discord.ui.View):
     @discord.ui.button(label="Post announcement", style=discord.ButtonStyle.success)
     async def post(self, interaction: discord.Interaction, button: discord.ui.Button):
         codes = self.chosen or ALL_CODES
-        embed = discord.Embed(description=self.text, color=0x5865F2)
         try:
-            msg = await self.channel.send(embed=embed, view=TranslateView(codes))
+            msg = await self.channel.send(content=self.text, view=TranslateView(codes))
         except discord.Forbidden:
             await interaction.response.edit_message(
                 content="I can't post in that channel. Please check my permissions there.",
@@ -148,7 +149,7 @@ class AnnouncementModal(discord.ui.Modal, title="New announcement"):
     message = discord.ui.TextInput(
         label="Announcement",
         style=discord.TextStyle.paragraph,
-        max_length=4000,
+        max_length=2000,
         placeholder="Type your announcement here…",
     )
 
