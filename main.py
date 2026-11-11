@@ -331,6 +331,117 @@ class AnnouncementModal(discord.ui.Modal, title="New announcement"):
         )
 
 
+# ---------- /manager-access panel (admins only) ----------
+def panel_text(guild_id):
+    rows = run_db("SELECT role_id FROM allowed_roles WHERE guild_id = ?", (guild_id,))
+    if rows:
+        roles = "\n".join(f"• <@&{r[0]}>" for r in rows)
+    else:
+        roles = "No roles added yet."
+    return (
+        "**🔑 Manager access**\n"
+        "Roles that can use `/send`:\n"
+        f"{roles}\n\n"
+        "Administrators can always use it.\n"
+        f"📊 New translations today (UTC): **{used_today(guild_id)} / {DAILY_CAP}**"
+    )
+
+
+class AdminOnlyView(discord.ui.View):
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.guild_permissions.administrator:
+            return True
+        await interaction.response.send_message(
+            "Only administrators can do this.", ephemeral=True
+        )
+        return False
+
+
+class ManagerPanelView(AdminOnlyView):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Add role", style=discord.ButtonStyle.success, emoji="➕")
+    async def add(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Pick the role you want to **add**:", view=AddRoleView()
+        )
+
+    @discord.ui.button(label="Remove role", style=discord.ButtonStyle.danger, emoji="➖")
+    async def remove(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rows = run_db("SELECT role_id FROM allowed_roles WHERE guild_id = ?", (interaction.guild_id,))
+        if not rows:
+            await interaction.response.send_message(
+                "There are no roles to remove yet.", ephemeral=True
+            )
+            return
+        await interaction.response.edit_message(
+            content="Pick the role you want to **remove**:",
+            view=RemoveRoleView(interaction.guild, [r[0] for r in rows]),
+        )
+
+
+class AddRoleView(AdminOnlyView):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect, placeholder="Choose a role", min_values=1, max_values=1
+    )
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        role = select.values[0]
+        if role.is_default():
+            await interaction.response.send_message(
+                "You can't add @everyone, because that would let every member post announcements.",
+                ephemeral=True,
+            )
+            return
+        run_db(
+            "INSERT OR IGNORE INTO allowed_roles (guild_id, role_id) VALUES (?, ?)",
+            (interaction.guild_id, role.id),
+        )
+        await interaction.response.edit_message(
+            content=panel_text(interaction.guild_id), view=ManagerPanelView()
+        )
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=panel_text(interaction.guild_id), view=ManagerPanelView()
+        )
+
+
+class RemoveRoleView(AdminOnlyView):
+    def __init__(self, guild, role_ids):
+        super().__init__(timeout=300)
+        options = []
+        for rid in role_ids[:25]:
+            role = guild.get_role(rid) if guild else None
+            label = role.name[:100] if role else f"Deleted role ({rid})"
+            options.append(discord.SelectOption(label=label, value=str(rid)))
+        select = discord.ui.Select(placeholder="Choose a role to remove", options=options)
+        select.callback = self.on_pick
+        self.add_item(select)
+        back = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary)
+        back.callback = self.on_back
+        self.add_item(back)
+
+    async def on_pick(self, interaction: discord.Interaction):
+        role_id = int(interaction.data["values"][0])
+        run_db(
+            "DELETE FROM allowed_roles WHERE guild_id = ? AND role_id = ?",
+            (interaction.guild_id, role_id),
+        )
+        await interaction.response.edit_message(
+            content=panel_text(interaction.guild_id), view=ManagerPanelView()
+        )
+
+    async def on_back(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content=panel_text(interaction.guild_id), view=ManagerPanelView()
+        )
+
+
 # ---------- the bot ----------
 class TranslateBot(discord.Client):
     def __init__(self):
@@ -362,71 +473,23 @@ async def ping(interaction: discord.Interaction):
 async def send(interaction: discord.Interaction, channel: discord.TextChannel):
     if not can_send(interaction):
         await interaction.response.send_message(
-            "You don't have permission to use this command. Ask an admin to add your role with `/manage add-role`.",
+            "You don't have permission to use this command. Ask an admin to add your role with `/manager-access`.",
             ephemeral=True,
         )
         return
     await interaction.response.send_modal(AnnouncementModal(channel))
 
 
-# ---------- /manage (admins only) ----------
-manage = app_commands.Group(
-    name="manage",
-    description="Choose who can post announcements",
-    default_permissions=discord.Permissions(administrator=True),
-    guild_only=True,
+@bot.tree.command(
+    name="manager-access",
+    description="See and change which roles can post announcements",
 )
-NO_PINGS = discord.AllowedMentions.none()
-
-
-@manage.command(name="add-role", description="Allow a role to use /send")
-@app_commands.describe(role="The role to allow")
-async def manage_add_role(interaction: discord.Interaction, role: discord.Role):
-    run_db(
-        "INSERT OR IGNORE INTO allowed_roles (guild_id, role_id) VALUES (?, ?)",
-        (interaction.guild_id, role.id),
-    )
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def manager_access(interaction: discord.Interaction):
     await interaction.response.send_message(
-        f"✅ {role.mention} can now use `/send`.", ephemeral=True, allowed_mentions=NO_PINGS
+        panel_text(interaction.guild_id), view=ManagerPanelView(), ephemeral=True
     )
 
-
-@manage.command(name="remove-role", description="Stop a role from using /send")
-@app_commands.describe(role="The role to remove")
-async def manage_remove_role(interaction: discord.Interaction, role: discord.Role):
-    run_db(
-        "DELETE FROM allowed_roles WHERE guild_id = ? AND role_id = ?",
-        (interaction.guild_id, role.id),
-    )
-    await interaction.response.send_message(
-        f"✅ {role.mention} can no longer use `/send`.", ephemeral=True, allowed_mentions=NO_PINGS
-    )
-
-
-@manage.command(name="list", description="Show which roles can use /send")
-async def manage_list(interaction: discord.Interaction):
-    rows = run_db("SELECT role_id FROM allowed_roles WHERE guild_id = ?", (interaction.guild_id,))
-    if rows:
-        roles = "\n".join(f"• <@&{r[0]}>" for r in rows)
-    else:
-        roles = "No roles added yet."
-    await interaction.response.send_message(
-        f"**Roles that can use `/send`:**\n{roles}\n\n(Administrators can always use it.)",
-        ephemeral=True,
-        allowed_mentions=NO_PINGS,
-    )
-
-
-@manage.command(name="usage", description="Show today's translation usage")
-async def manage_usage(interaction: discord.Interaction):
-    used = used_today(interaction.guild_id)
-    await interaction.response.send_message(
-        f"📊 New translations today (UTC): **{used} / {DAILY_CAP}**\n"
-        f"Repeat translations of the same announcement are cached and don't count.",
-        ephemeral=True,
-    )
-
-
-bot.tree.add_command(manage)
 
 bot.run(TOKEN)
