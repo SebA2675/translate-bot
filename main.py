@@ -1,6 +1,9 @@
 import os
 import json
+import time
 import sqlite3
+from datetime import datetime, timezone
+
 import aiohttp
 import discord
 from discord import app_commands
@@ -8,6 +11,8 @@ from discord import app_commands
 TOKEN = os.environ["DISCORD_TOKEN"]
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+DAILY_CAP = int(os.environ.get("DAILY_CAP", "100"))              # new translations per server per day
+COOLDOWN_SECONDS = float(os.environ.get("COOLDOWN_SECONDS", "5"))  # per user between picks
 DB_PATH = "bot.db"
 
 # (code, native name, flag), 25 languages = the max for one dropdown
@@ -75,6 +80,59 @@ def init_db():
         "message_id INTEGER NOT NULL, lang TEXT NOT NULL, translation TEXT NOT NULL, "
         "PRIMARY KEY (message_id, lang))"
     )
+    run_db(
+        "CREATE TABLE IF NOT EXISTS allowed_roles ("
+        "guild_id INTEGER NOT NULL, role_id INTEGER NOT NULL, "
+        "PRIMARY KEY (guild_id, role_id))"
+    )
+    run_db(
+        "CREATE TABLE IF NOT EXISTS usage ("
+        "guild_id INTEGER NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, "
+        "PRIMARY KEY (guild_id, day))"
+    )
+
+
+# ---------- limits ----------
+class CapReached(Exception):
+    pass
+
+
+_last_use = {}
+
+
+def on_cooldown(user_id):
+    now = time.monotonic()
+    if now - _last_use.get(user_id, 0) < COOLDOWN_SECONDS:
+        return True
+    _last_use[user_id] = now
+    return False
+
+
+def today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def used_today(guild_id):
+    rows = run_db("SELECT count FROM usage WHERE guild_id = ? AND day = ?", (guild_id, today()))
+    return rows[0][0] if rows else 0
+
+
+def add_usage(guild_id):
+    run_db(
+        "INSERT INTO usage (guild_id, day, count) VALUES (?, ?, 1) "
+        "ON CONFLICT(guild_id, day) DO UPDATE SET count = count + 1",
+        (guild_id, today()),
+    )
+
+
+# ---------- who can use /send ----------
+def can_send(interaction: discord.Interaction):
+    member = interaction.user
+    if member.guild_permissions.administrator:
+        return True
+    rows = run_db("SELECT role_id FROM allowed_roles WHERE guild_id = ?", (interaction.guild_id,))
+    allowed = {r[0] for r in rows}
+    return any(role.id in allowed for role in member.roles)
 
 
 # ---------- translation (OpenAI) ----------
@@ -82,14 +140,17 @@ def split_text(s, n=1900):
     return [s[i:i + n] for i in range(0, len(s), n)] or [""]
 
 
-async def translate(message_id, text, code):
-    """Returns the translation, or None if something went wrong."""
+async def translate(guild_id, message_id, text, code):
+    """Returns the translation, None on error. Raises CapReached if the server's daily cap is used up."""
     cached = run_db(
         "SELECT translation FROM translations WHERE message_id = ? AND lang = ?",
         (message_id, code),
     )
     if cached:
-        return cached[0][0]
+        return cached[0][0]  # cached = free, never counts toward the cap
+
+    if used_today(guild_id) >= DAILY_CAP:
+        raise CapReached()
 
     if not OPENAI_API_KEY:
         print("OPENAI_API_KEY is not set")
@@ -141,6 +202,7 @@ async def translate(message_id, text, code):
         "INSERT OR REPLACE INTO translations (message_id, lang, translation) VALUES (?, ?, ?)",
         (message_id, code, result),
     )
+    add_usage(guild_id)
     return result
 
 
@@ -175,7 +237,21 @@ class LanguageSelect(discord.ui.Select):
         # reset the dropdown so the same language can be picked again
         await interaction.response.edit_message(view=TranslateView(json.loads(langs_json)))
 
-        translated = await translate(interaction.message.id, text, code)
+        if on_cooldown(interaction.user.id):
+            await interaction.followup.send(
+                "⏳ Please wait a few seconds before translating again.", ephemeral=True
+            )
+            return
+
+        try:
+            translated = await translate(interaction.guild_id, interaction.message.id, text, code)
+        except CapReached:
+            await interaction.followup.send(
+                "⚠️ This server reached its daily translation limit. Please try again tomorrow.",
+                ephemeral=True,
+            )
+            return
+
         if translated is None:
             await interaction.followup.send(
                 "⚠️ Translation is unavailable right now. Please try again in a moment.",
@@ -282,10 +358,75 @@ async def ping(interaction: discord.Interaction):
 
 @bot.tree.command(name="send", description="Post an announcement with a translation menu")
 @app_commands.describe(channel="Where to post the announcement")
-@app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def send(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to use this command. Ask an admin to add your role with `/manage add-role`.",
+            ephemeral=True,
+        )
+        return
     await interaction.response.send_modal(AnnouncementModal(channel))
 
+
+# ---------- /manage (admins only) ----------
+manage = app_commands.Group(
+    name="manage",
+    description="Choose who can post announcements",
+    default_permissions=discord.Permissions(administrator=True),
+    guild_only=True,
+)
+NO_PINGS = discord.AllowedMentions.none()
+
+
+@manage.command(name="add-role", description="Allow a role to use /send")
+@app_commands.describe(role="The role to allow")
+async def manage_add_role(interaction: discord.Interaction, role: discord.Role):
+    run_db(
+        "INSERT OR IGNORE INTO allowed_roles (guild_id, role_id) VALUES (?, ?)",
+        (interaction.guild_id, role.id),
+    )
+    await interaction.response.send_message(
+        f"✅ {role.mention} can now use `/send`.", ephemeral=True, allowed_mentions=NO_PINGS
+    )
+
+
+@manage.command(name="remove-role", description="Stop a role from using /send")
+@app_commands.describe(role="The role to remove")
+async def manage_remove_role(interaction: discord.Interaction, role: discord.Role):
+    run_db(
+        "DELETE FROM allowed_roles WHERE guild_id = ? AND role_id = ?",
+        (interaction.guild_id, role.id),
+    )
+    await interaction.response.send_message(
+        f"✅ {role.mention} can no longer use `/send`.", ephemeral=True, allowed_mentions=NO_PINGS
+    )
+
+
+@manage.command(name="list", description="Show which roles can use /send")
+async def manage_list(interaction: discord.Interaction):
+    rows = run_db("SELECT role_id FROM allowed_roles WHERE guild_id = ?", (interaction.guild_id,))
+    if rows:
+        roles = "\n".join(f"• <@&{r[0]}>" for r in rows)
+    else:
+        roles = "No roles added yet."
+    await interaction.response.send_message(
+        f"**Roles that can use `/send`:**\n{roles}\n\n(Administrators can always use it.)",
+        ephemeral=True,
+        allowed_mentions=NO_PINGS,
+    )
+
+
+@manage.command(name="usage", description="Show today's translation usage")
+async def manage_usage(interaction: discord.Interaction):
+    used = used_today(interaction.guild_id)
+    await interaction.response.send_message(
+        f"📊 New translations today (UTC): **{used} / {DAILY_CAP}**\n"
+        f"Repeat translations of the same announcement are cached and don't count.",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(manage)
 
 bot.run(TOKEN)
