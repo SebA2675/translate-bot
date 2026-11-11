@@ -90,6 +90,10 @@ def init_db():
         "guild_id INTEGER NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, "
         "PRIMARY KEY (guild_id, day))"
     )
+    run_db(
+        "CREATE TABLE IF NOT EXISTS settings ("
+        "guild_id INTEGER PRIMARY KEY, log_channel_id INTEGER)"
+    )
 
 
 # ---------- limits ----------
@@ -98,6 +102,7 @@ class CapReached(Exception):
 
 
 _last_use = {}
+_cap_logged = set()
 
 
 def on_cooldown(user_id):
@@ -123,6 +128,47 @@ def add_usage(guild_id):
         "ON CONFLICT(guild_id, day) DO UPDATE SET count = count + 1",
         (guild_id, today()),
     )
+
+
+# ---------- logs ----------
+def get_log_channel_id(guild_id):
+    rows = run_db("SELECT log_channel_id FROM settings WHERE guild_id = ?", (guild_id,))
+    return rows[0][0] if rows and rows[0][0] else None
+
+
+def set_log_channel_id(guild_id, channel_id):
+    run_db(
+        "INSERT INTO settings (guild_id, log_channel_id) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET log_channel_id = excluded.log_channel_id",
+        (guild_id, channel_id),
+    )
+
+
+async def send_log(guild, title, description, color=0x5865F2):
+    """Writes one log entry to this server's log channel (if one is set). Never raises."""
+    if guild is None:
+        return
+    channel_id = get_log_channel_id(guild.id)
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        return
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    try:
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException as e:
+        print(f"Could not write log: {e!r}")
+
+
+def preview(text, n=200):
+    one_line = " ".join(text.split())
+    return one_line if len(one_line) <= n else one_line[: n - 1] + "…"
 
 
 # ---------- who can use /send ----------
@@ -250,6 +296,16 @@ class LanguageSelect(discord.ui.Select):
                 "⚠️ This server reached its daily translation limit. Please try again tomorrow.",
                 ephemeral=True,
             )
+            key = (interaction.guild_id, today())
+            if key not in _cap_logged:
+                _cap_logged.add(key)
+                await send_log(
+                    interaction.guild,
+                    "⚠️ Daily limit reached",
+                    f"This server used all **{DAILY_CAP}** new translations for today (UTC). "
+                    f"Translations that are already saved still work. The limit resets tomorrow.",
+                    color=0xED4245,
+                )
             return
 
         if translated is None:
@@ -308,6 +364,15 @@ class PickLanguagesView(discord.ui.View):
         await interaction.response.edit_message(
             content=f"✅ Posted in {self.channel.mention}", view=None
         )
+        await send_log(
+            interaction.guild,
+            "📢 Announcement posted",
+            f"**By:** {interaction.user.mention}\n"
+            f"**Channel:** {self.channel.mention}\n"
+            f"**Languages offered:** {len(codes)}\n"
+            f"**Message:** [Jump to announcement]({msg.jump_url})\n\n"
+            f"> {preview(self.text)}",
+        )
 
 
 class AnnouncementModal(discord.ui.Modal, title="New announcement"):
@@ -338,11 +403,14 @@ def panel_text(guild_id):
         roles = "\n".join(f"• <@&{r[0]}>" for r in rows)
     else:
         roles = "No roles added yet."
+    log_id = get_log_channel_id(guild_id)
+    log_line = f"<#{log_id}>" if log_id else "Not set"
     return (
         "**🔑 Manager access**\n"
         "Roles that can use `/send`:\n"
         f"{roles}\n\n"
         "Administrators can always use it.\n"
+        f"📝 Log channel: {log_line}\n"
         f"📊 New translations today (UTC): **{used_today(guild_id)} / {DAILY_CAP}**"
     )
 
@@ -380,6 +448,14 @@ class ManagerPanelView(AdminOnlyView):
             view=RemoveRoleView(interaction.guild, [r[0] for r in rows]),
         )
 
+    @discord.ui.button(label="Log channel", style=discord.ButtonStyle.secondary, emoji="📝")
+    async def log_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Pick the channel where logs should be posted.\n"
+            "Make it a **private staff channel**, because anyone who can see that channel can see the logs.",
+            view=LogChannelView(),
+        )
+
 
 class AddRoleView(AdminOnlyView):
     def __init__(self):
@@ -402,6 +478,12 @@ class AddRoleView(AdminOnlyView):
         )
         await interaction.response.edit_message(
             content=panel_text(interaction.guild_id), view=ManagerPanelView()
+        )
+        await send_log(
+            interaction.guild,
+            "➕ Manager role added",
+            f"{role.mention} can now use `/send`.\n**By:** {interaction.user.mention}",
+            color=0x57F287,
         )
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
@@ -435,8 +517,65 @@ class RemoveRoleView(AdminOnlyView):
         await interaction.response.edit_message(
             content=panel_text(interaction.guild_id), view=ManagerPanelView()
         )
+        await send_log(
+            interaction.guild,
+            "➖ Manager role removed",
+            f"<@&{role_id}> can no longer use `/send`.\n**By:** {interaction.user.mention}",
+            color=0xFEE75C,
+        )
 
     async def on_back(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content=panel_text(interaction.guild_id), view=ManagerPanelView()
+        )
+
+
+class LogChannelView(AdminOnlyView):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="Choose the log channel",
+        min_values=1,
+        max_values=1,
+    )
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        channel = interaction.guild.get_channel(select.values[0].id)
+        perms = channel.permissions_for(interaction.guild.me) if channel else None
+        if channel is None or not (perms.view_channel and perms.send_messages and perms.embed_links):
+            await interaction.response.send_message(
+                "I can't post there. Give me **View Channel**, **Send Messages** and **Embed Links** "
+                "in that channel, then try again.",
+                ephemeral=True,
+            )
+            return
+        set_log_channel_id(interaction.guild_id, channel.id)
+        await interaction.response.edit_message(
+            content=panel_text(interaction.guild_id), view=ManagerPanelView()
+        )
+        await send_log(
+            interaction.guild,
+            "📝 Logging turned on",
+            f"Logs for this bot will be posted here.\n**Set by:** {interaction.user.mention}",
+        )
+
+    @discord.ui.button(label="Turn off logs", style=discord.ButtonStyle.danger)
+    async def turn_off(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_log(
+            interaction.guild,
+            "📝 Logging turned off",
+            f"**By:** {interaction.user.mention}",
+            color=0xFEE75C,
+        )
+        set_log_channel_id(interaction.guild_id, None)
+        await interaction.response.edit_message(
+            content=panel_text(interaction.guild_id), view=ManagerPanelView()
+        )
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             content=panel_text(interaction.guild_id), view=ManagerPanelView()
         )
