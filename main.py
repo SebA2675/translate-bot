@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import asyncio
 import sqlite3
 from datetime import datetime, timezone
 
@@ -103,6 +104,7 @@ class CapReached(Exception):
 
 _last_use = {}
 _cap_logged = set()
+_inflight = {}  # (message_id, lang) -> running translation task
 
 
 def on_cooldown(user_id):
@@ -186,18 +188,8 @@ def split_text(s, n=1900):
     return [s[i:i + n] for i in range(0, len(s), n)] or [""]
 
 
-async def translate(guild_id, message_id, text, code):
-    """Returns the translation, None on error. Raises CapReached if the server's daily cap is used up."""
-    cached = run_db(
-        "SELECT translation FROM translations WHERE message_id = ? AND lang = ?",
-        (message_id, code),
-    )
-    if cached:
-        return cached[0][0]  # cached = free, never counts toward the cap
-
-    if used_today(guild_id) >= DAILY_CAP:
-        raise CapReached()
-
+async def _translate_uncached(guild_id, message_id, text, code):
+    """Does the real OpenAI call. Returns the translation, or None on error."""
     if not OPENAI_API_KEY:
         print("OPENAI_API_KEY is not set")
         return None
@@ -250,6 +242,30 @@ async def translate(guild_id, message_id, text, code):
     )
     add_usage(guild_id)
     return result
+
+
+async def translate(guild_id, message_id, text, code):
+    """Returns the translation, or None on error. Raises CapReached if the daily cap is used up.
+
+    Saved translations are free. If many people ask for the same announcement + language
+    at the same moment, only ONE OpenAI request is made and everyone shares the result.
+    """
+    cached = run_db(
+        "SELECT translation FROM translations WHERE message_id = ? AND lang = ?",
+        (message_id, code),
+    )
+    if cached:
+        return cached[0][0]
+
+    key = (message_id, code)
+    task = _inflight.get(key)
+    if task is None:
+        if used_today(guild_id) >= DAILY_CAP:
+            raise CapReached()
+        task = asyncio.create_task(_translate_uncached(guild_id, message_id, text, code))
+        _inflight[key] = task
+        task.add_done_callback(lambda _t, k=key: _inflight.pop(k, None))
+    return await asyncio.shield(task)
 
 
 # ---------- the dropdown under each announcement ----------
