@@ -3319,22 +3319,27 @@ async def help_command(interaction: discord.Interaction):
             inline=False,
         )
         embed.add_field(
-            name="🛡️ For Admins & Managers",
+            name="📢 Announcements & Scheduling",
             value=(
-                "• `/send`: Interactive modal with live preview, role pings, link buttons & multi-channel posting.\n"
-                "• `/schedule`: Schedule announcements with date/time picker.\n"
-                "• **Context Menu:** Right-click announcement → **Apps** → **Set official translation** (free manual edits).\n"
-                "• **Context Menu:** Right-click announcement → **Apps** → **Edit announcement** / **Delete announcement**.\n"
-                "• `/scheduled`: View or cancel upcoming announcements.\n"
+                "• `/send`: Interactive modal with live preview, role ping, buttons & multi-channel posting.\n"
+                "• `/schedule`: Schedule announcements for a future date/time.\n"
+                "• `/scheduled`: View or cancel pending announcements.\n"
                 "• `/template`: Save and reuse announcement templates.\n"
-                "• `/glossary`: Keep branded terms untranslated or map them to fixed translations.\n"
-                "• `/settings`: Set server default languages and translation tone.\n"
-                "• `/stats`: View translation analytics, daily quotas & top requested languages.\n"
-                "• `/language-roles`: Create a persistent self-serve role dropdown panel.\n"
+                "• Right-click announcement → **Apps** → **Set official translation** (free manual edits).\n"
+                "• Right-click announcement → **Apps** → **Edit announcement** / **Delete announcement**."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="⚙️ Server Configuration & Management",
+            value=(
+                "• `/glossary`: Lock brand names untranslated or set fixed translations.\n"
+                "• `/settings`: Set default announcement languages and translation tone.\n"
+                "• `/stats`: View server translation analytics, quotas & top languages.\n"
+                "• `/language-roles`: Create a self-serve language role dropdown panel.\n"
                 "• `/rules-panel`: Post multilingual rules or welcome panels.\n"
-                "• `/manager-access`: Set manager roles and private audit log channel.\n"
-                "• `/plan`: View or upgrade tier limits (Free, Pro, Ultra).\n"
-                "• `/migrate-db`: Migrate local SQLite database to PostgreSQL."
+                "• `/manager-access`: Configure manager roles and private log channel.\n"
+                "• `/plan view`: Check server tier limits (Owner grants plans via `/plan set`)."
             ),
             inline=False,
         )
@@ -4257,7 +4262,7 @@ async def plan_view(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@plan_group.command(name="set", description="Grant or update a server's plan (Administrator only)")
+@plan_group.command(name="set", description="Grant or update a server's plan (Bot Owner only)")
 @app_commands.describe(
     plan="The plan tier to grant",
     server_id="The server ID to grant the plan to (leave empty for this server)",
@@ -4272,9 +4277,9 @@ async def plan_set(
     duration_days: Optional[app_commands.Range[int, 1, 3650]] = None,
     custom_daily_cap: Optional[app_commands.Range[int, 10, 100000]] = None,
 ):
-    if not interaction.user.guild_permissions.administrator:
+    if not (OWNER_ID and interaction.user.id == OWNER_ID):
         await interaction.response.send_message(
-            "Only administrators can manage server plans.", ephemeral=True
+            "⛔ Only the bot owner can grant or modify server plans.", ephemeral=True
         )
         return
 
@@ -4315,12 +4320,12 @@ async def plan_set(
         )
 
 
-@plan_group.command(name="remove", description="Reset a server back to the Free plan (Administrator only)")
+@plan_group.command(name="remove", description="Reset a server back to the Free plan (Bot Owner only)")
 @app_commands.describe(server_id="The server ID to reset (leave empty for this server)")
 async def plan_remove(interaction: discord.Interaction, server_id: Optional[str] = None):
-    if not interaction.user.guild_permissions.administrator:
+    if not (OWNER_ID and interaction.user.id == OWNER_ID):
         await interaction.response.send_message(
-            "Only administrators can manage server plans.", ephemeral=True
+            "⛔ Only the bot owner can reset server plans.", ephemeral=True
         )
         return
 
@@ -4684,11 +4689,11 @@ async def privacy_command(interaction: discord.Interaction):
 
 
 # ---------- database migration command (Update 9) ----------
-@bot.tree.command(name="migrate-db", description="Migrate local SQLite data to PostgreSQL (Administrator only)")
+@bot.tree.command(name="migrate-db", description="Migrate local SQLite data to PostgreSQL (Bot Owner only)")
 async def migrate_db_command(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
+    if not (OWNER_ID and interaction.user.id == OWNER_ID):
         await interaction.response.send_message(
-            "Only administrators can run database migrations.", ephemeral=True
+            "⛔ Only the bot owner can run database migrations.", ephemeral=True
         )
         return
 
