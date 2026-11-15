@@ -245,9 +245,9 @@ def get_table_columns(table_name: str) -> list[str]:
             "SELECT column_name FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position",
             (table_name.lower(),),
         )
-        return [r[0] for r in rows]
+        return [str(r[0]).lower() for r in rows]
     else:
-        return [r[1] for r in run_db(f"PRAGMA table_info({table_name})")]
+        return [str(r[1]).lower() for r in run_db(f"PRAGMA table_info({table_name})")]
 
 
 def init_db():
@@ -288,8 +288,14 @@ def init_db():
     run_db(
         "CREATE TABLE IF NOT EXISTS text_translations ("
         "hash TEXT NOT NULL, lang TEXT NOT NULL, style TEXT NOT NULL, translation TEXT NOT NULL, "
+        "created_at INTEGER, "
         "PRIMARY KEY (hash, lang, style))"
     )
+    tt_cols = get_table_columns("text_translations")
+    if "created_at" not in tt_cols:
+        run_db("ALTER TABLE text_translations ADD COLUMN created_at INTEGER")
+        run_db("UPDATE text_translations SET created_at = ? WHERE created_at IS NULL", (int(time.time()),))
+
     run_db(
         "CREATE TABLE IF NOT EXISTS allowed_roles ("
         "guild_id INTEGER NOT NULL, role_id INTEGER NOT NULL, "
@@ -299,6 +305,10 @@ def init_db():
         "CREATE TABLE IF NOT EXISTS usage ("
         "guild_id INTEGER NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL, "
         "PRIMARY KEY (guild_id, day))"
+    )
+    run_db(
+        "CREATE TABLE IF NOT EXISTS global_usage ("
+        "day TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)"
     )
     run_db(
         "CREATE TABLE IF NOT EXISTS settings ("
@@ -747,13 +757,25 @@ async def notify_cap(interaction: discord.Interaction):
 
 
 # ---------- who can use /send, /schedule, /template, /glossary, /settings, /stats, /language-roles, /rules-panel ----------
-def can_send(interaction: discord.Interaction):
-    member = interaction.user
-    if member.guild_permissions.administrator:
+def can_send(interaction: discord.Interaction) -> bool:
+    user = interaction.user
+    if not user:
+        return False
+    if OWNER_ID and user.id == OWNER_ID:
         return True
-    rows = run_db("SELECT role_id FROM allowed_roles WHERE guild_id = ?", (interaction.guild_id,))
+    guild = interaction.guild
+    if guild and guild.owner_id == user.id:
+        return True
+    perms = getattr(user, "guild_permissions", None)
+    if perms and (perms.administrator or perms.manage_guild):
+        return True
+    guild_id = interaction.guild_id
+    if not guild_id:
+        return False
+    rows = run_db("SELECT role_id FROM allowed_roles WHERE guild_id = ?", (guild_id,))
     allowed = {r[0] for r in rows}
-    return any(role.id in allowed for role in member.roles)
+    roles = getattr(user, "roles", [])
+    return any(getattr(role, "id", None) in allowed for role in roles)
 
 
 # ---------- server settings & defaults (Update 5) ----------
@@ -2983,12 +3005,33 @@ class TranslateBot(discord.Client):
         self.add_view(TranslateView())     # keeps old dropdowns and one-click buttons working after restarts
         self.add_view(LanguageRoleView())  # Update 6: persistent language role panels
         self.add_view(RulesPanelView())    # Update 6: persistent rules panels
-        await self.tree.sync()
+        synced = await self.tree.sync()
+        print(f"[Slash Commands] Successfully synced {len(synced)} application commands globally.")
         scheduler_loop.start()
         cleanup_loop.start()
 
 
 bot = TranslateBot()
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    cmd_name = getattr(interaction.command, 'name', 'unknown')
+    print(f"[Slash Command Error] in /{cmd_name}: {error}")
+    try:
+        msg = "⚠️ An error occurred while executing this command. Please try again."
+        if isinstance(error, app_commands.CommandOnCooldown):
+            msg = f"⏳ Cooldown: try again in {error.retry_after:.1f}s."
+        elif isinstance(error, app_commands.NoPrivateMessage):
+            msg = "❌ This command can only be used inside a server."
+        elif isinstance(error, app_commands.MissingPermissions):
+            msg = "❌ You don't have permission to use this command."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 
 # ---------- the scheduler: runs every 30 seconds ----------
@@ -3128,26 +3171,30 @@ async def cleanup_loop():
         cutoff_ts = now_ts - retention_sec
 
         # 1. Delete announcements and their translations older than RETENTION_DAYS
-        old_anns = run_db(
-            "SELECT message_id FROM announcements WHERE created_at IS NOT NULL AND created_at <= ?",
-            (cutoff_ts,),
-        )
-        if old_anns:
-            ann_ids = [r[0] for r in old_anns]
-            for start in range(0, len(ann_ids), 100):
-                chunk = ann_ids[start:start+100]
-                placeholders = ",".join(["?"] * len(chunk))
-                run_db(f"DELETE FROM translations WHERE message_id IN ({placeholders})", chunk)
-                run_db(f"DELETE FROM announcements WHERE message_id IN ({placeholders})", chunk)
-            print(f"[Cleanup] Deleted {len(ann_ids)} expired announcements and their translations.")
+        ann_cols = get_table_columns("announcements")
+        if "created_at" in ann_cols:
+            old_anns = run_db(
+                "SELECT message_id FROM announcements WHERE created_at IS NOT NULL AND created_at <= ?",
+                (cutoff_ts,),
+            )
+            if old_anns:
+                ann_ids = [r[0] for r in old_anns]
+                for start in range(0, len(ann_ids), 100):
+                    chunk = ann_ids[start:start+100]
+                    placeholders = ",".join(["?"] * len(chunk))
+                    run_db(f"DELETE FROM translations WHERE message_id IN ({placeholders})", chunk)
+                    run_db(f"DELETE FROM announcements WHERE message_id IN ({placeholders})", chunk)
+                print(f"[Cleanup] Deleted {len(ann_ids)} expired announcements and their translations.")
 
         # 2. Delete expired text_translations older than RETENTION_DAYS
-        _, cnt_text = run_db_rowcount(
-            "DELETE FROM text_translations WHERE created_at IS NOT NULL AND created_at <= ?",
-            (cutoff_ts,),
-        )
-        if cnt_text > 0:
-            print(f"[Cleanup] Deleted {cnt_text} expired text translations.")
+        tt_cols = get_table_columns("text_translations")
+        if "created_at" in tt_cols:
+            _, cnt_text = run_db_rowcount(
+                "DELETE FROM text_translations WHERE created_at IS NOT NULL AND created_at <= ?",
+                (cutoff_ts,),
+            )
+            if cnt_text > 0:
+                print(f"[Cleanup] Deleted {cnt_text} expired text translations.")
 
         # 3. Finished scheduled announcements older than 30 days
         sched_cutoff = now_ts - (30 * 86400)
@@ -3250,41 +3297,65 @@ async def ping(interaction: discord.Interaction):
 
 @bot.tree.command(name="help", description="How to use this bot")
 async def help_command(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "**🌐 Translator bot: help**\n\n"
-        "**For members**\n"
-        "• Under an announcement, pick your language from the 🌐 dropdown or click **Translate to my language** to translate privately.\n"
-        "• Click **Report translation** (🚩) under any translation to alert server staff of errors.\n"
-        "• Under a language roles panel, pick your language to receive its role.\n"
-        "• `/mylanguage`: save your language once for automatic translations.\n"
-        "• Right-click any message → **Apps** → **Translate message** to translate it privately.\n"
-        "• `/translate`: translate any text you type.\n"
-        "• `/explain`: explain unfamiliar slang, idioms, acronyms, or phrases in your language.\n"
-        "• Right-click any message → **Apps** → **Explain slang/phrase** to explain slang in that message.\n"
-        "• `/privacy`: view data retention, privacy policy, and AI processing details.\n\n"
-        "**For admins and managers**\n"
-        "• `/send [channel] [image?]`: post an announcement with preview, role ping, link buttons, and multi-channel posting.\n"
-        "• `/schedule [channel]`: schedule announcements with the same options as `/send`.\n"
-        "• Right-click any bot announcement → **Apps** → **Set official translation**: set human-reviewed translations with zero API cost.\n"
-        "• Right-click any bot announcement → **Apps** → **Edit announcement**: update announcement text and invalidate stale translations.\n"
-        "• Right-click any bot announcement → **Apps** → **Delete announcement**: delete announcement and cached translations.\n"
-        "• `/scheduled`: view or cancel scheduled announcements.\n"
-        "• `/template save/list/use/delete`: manage announcement templates.\n"
-        "• `/glossary add/list/remove/clear`: configure terms that stay untranslated or translate a fixed way.\n"
-        "• `/settings`: configure server defaults (default announcement languages, translation tone).\n"
-        "• `/stats`: view translation activity, daily usage breakdown, and top requested languages.\n"
-        "• `/language-roles add/remove/list/post`: create a self-serve language role dropdown panel.\n"
-        "• `/rules-panel post [channel]`: post a rules or welcome panel with multi-language dropdown translations.\n"
-        "• `/plan view/set/remove`: manage server plan tier (Free, Pro, Ultra).\n"
-        "• `/migrate-db`: migrate local SQLite data to PostgreSQL (administrators only).\n"
-        "• `/manager-access`: configure manager roles and set private audit log channel.\n\n"
-        "**Setup tips**\n"
-        "• The bot needs **View Channel**, **Send Messages** and **Embed Links** in channels it posts or logs in.\n"
-        "• For language roles, the bot needs **Manage Roles** and its role must be **above** the language roles in Server Settings.\n"
-        "• For role pings to work, the role must be **mentionable**, or the bot needs **Mention Everyone**.\n"
-        f"• Free tier servers get **{DAILY_CAP}** new translations per day (Pro: 500, Ultra: 2000). Already-cached translations are free.",
-        ephemeral=True,
-    )
+    try:
+        embed = discord.Embed(
+            title="🌐 Griedon Translator • Help & Commands",
+            description="High-quality AI translations powered by OpenAI & Gemini with glossary preservation, tone customization, and self-serve language roles.",
+            color=0x5865F2,
+        )
+        embed.add_field(
+            name="👤 For Members",
+            value=(
+                "• **Translate Announcements:** Pick your language from the 🌐 dropdown or click **Translate to my language**.\n"
+                "• **Report Errors:** Click **Report translation** (🚩) under any translation to notify staff.\n"
+                "• **Language Roles:** Pick your language from a language role panel to get the role.\n"
+                "• `/mylanguage [lang]`: Save your preferred language once for instant one-click translations.\n"
+                "• **Context Menu:** Right-click message → **Apps** → **Translate message**.\n"
+                "• `/translate [text] [lang] [tone]`: Translate any custom text privately.\n"
+                "• `/explain [phrase]`: Explain slang, idioms, or acronyms in your language.\n"
+                "• **Context Menu:** Right-click message → **Apps** → **Explain slang/phrase**.\n"
+                "• `/privacy`: View data retention, privacy policy, and AI terms."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🛡️ For Admins & Managers",
+            value=(
+                "• `/send`: Interactive modal with live preview, role pings, link buttons & multi-channel posting.\n"
+                "• `/schedule`: Schedule announcements with date/time picker.\n"
+                "• **Context Menu:** Right-click announcement → **Apps** → **Set official translation** (free manual edits).\n"
+                "• **Context Menu:** Right-click announcement → **Apps** → **Edit announcement** / **Delete announcement**.\n"
+                "• `/scheduled`: View or cancel upcoming announcements.\n"
+                "• `/template`: Save and reuse announcement templates.\n"
+                "• `/glossary`: Keep branded terms untranslated or map them to fixed translations.\n"
+                "• `/settings`: Set server default languages and translation tone.\n"
+                "• `/stats`: View translation analytics, daily quotas & top requested languages.\n"
+                "• `/language-roles`: Create a persistent self-serve role dropdown panel.\n"
+                "• `/rules-panel`: Post multilingual rules or welcome panels.\n"
+                "• `/manager-access`: Set manager roles and private audit log channel.\n"
+                "• `/plan`: View or upgrade tier limits (Free, Pro, Ultra).\n"
+                "• `/migrate-db`: Migrate local SQLite database to PostgreSQL."
+            ),
+            inline=False,
+        )
+        tips_lines = [
+            "• Bot needs **View Channel**, **Send Messages**, and **Embed Links** in posting channels.",
+            "• For language roles, bot needs **Manage Roles** and its role must be **above** target roles.",
+            f"• Free tier servers get **{DAILY_CAP}** new translations/day (Pro: 500, Ultra: 2000). Cached translations are always free!",
+        ]
+        if SUPPORT_URL:
+            tips_lines.append(f"• Need help? Join our [Support Server]({SUPPORT_URL})")
+        embed.add_field(
+            name="💡 Setup Tips & Quotas",
+            value="\n".join(tips_lines),
+            inline=False,
+        )
+        embed.set_footer(text="Griedon Translator • Multilingual Discord Made Easy")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        print(f"Error in /help command: {e}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message("❌ Failed to display help menu.", ephemeral=True)
 
 
 @bot.tree.command(name="mylanguage", description="Save (or check) your preferred language for translations")
@@ -3561,93 +3632,103 @@ async def settings_command(interaction: discord.Interaction):
 @bot.tree.command(name="stats", description="View translation activity and top languages for this server")
 @app_commands.guild_only()
 async def stats_command(interaction: discord.Interaction):
-    if not can_send(interaction):
-        await interaction.response.send_message(
-            "You don't have permission to view stats. "
-            "Ask an admin to add your role with `/manager-access`.",
-            ephemeral=True,
+    try:
+        if not can_send(interaction):
+            await interaction.response.send_message(
+                "You don't have permission to view stats. "
+                "Ask an admin to add your role with `/manager-access`.",
+                ephemeral=True,
+            )
+            return
+
+        guild_id = interaction.guild_id
+        if not guild_id:
+            await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+            return
+
+        guild_name = interaction.guild.name if interaction.guild else f"Server {guild_id}"
+        today_count = used_today(guild_id)
+        history = get_daily_usage_history(guild_id, 7)
+        top_langs = get_top_languages(guild_id, 8)
+
+        week_total = sum(c for _, c in history)
+
+        if history:
+            history_lines = [f"• `{d}`: **{c}**" for d, c in history]
+            history_text = "\n".join(history_lines) + f"\n*7-day total: **{week_total}** translations*"
+        else:
+            history_text = "*No translations recorded in the past 7 days.*"
+
+        total_lang_count = sum(c for _, c in top_langs)
+        if top_langs and total_lang_count > 0:
+            lang_lines = []
+            for i, (code, count) in enumerate(top_langs, 1):
+                name, flag = LANG_BY_CODE.get(code, (code, "🌐"))
+                pct = int((count / total_lang_count) * 100)
+                lang_lines.append(f"{i}. {flag} **{name}**: {count} `({pct}%)`")
+            top_langs_text = "\n".join(lang_lines)
+        else:
+            top_langs_text = "*No language data recorded yet.*"
+
+        ann_count_rows = run_db("SELECT COUNT(*) FROM announcements WHERE guild_id = ?", (guild_id,))
+        ann_count = ann_count_rows[0][0] if ann_count_rows else 0
+        sched_count = pending_count(guild_id)
+        tpl_count = count_templates(guild_id)
+        glossary_cnt = count_glossary(guild_id)
+
+        limits = get_server_limits(guild_id)
+        cap = limits.get("daily_cap", DAILY_CAP) or DAILY_CAP
+        pct_today = min(100, int((today_count / cap) * 100)) if cap > 0 else 0
+        filled = min(10, max(0, int(pct_today / 10)))
+        bar = "█" * filled + "░" * (10 - filled)
+
+        embed = discord.Embed(
+            title=f"📊 Translation Analytics • {guild_name}",
+            color=0xFEE75C if limits.get("is_premium") else 0x5865F2,
+            timestamp=datetime.now(timezone.utc),
         )
-        return
-
-    guild_id = interaction.guild_id
-    today_count = used_today(guild_id)
-    history = get_daily_usage_history(guild_id, 7)
-    top_langs = get_top_languages(guild_id, 8)
-
-    week_total = sum(c for _, c in history)
-
-    if history:
-        history_lines = [f"• `{d}`: **{c}**" for d, c in history]
-        history_text = "\n".join(history_lines) + f"\n*7-day total: **{week_total}** translations*"
-    else:
-        history_text = "*No translations recorded in the past 7 days.*"
-
-    total_lang_count = sum(c for _, c in top_langs)
-    if top_langs and total_lang_count > 0:
-        lang_lines = []
-        for i, (code, count) in enumerate(top_langs, 1):
-            name, flag = LANG_BY_CODE.get(code, (code, "🌐"))
-            pct = int((count / total_lang_count) * 100)
-            lang_lines.append(f"{i}. {flag} **{name}**: {count} `({pct}%)`")
-        top_langs_text = "\n".join(lang_lines)
-    else:
-        top_langs_text = "*No language data recorded yet.*"
-
-    ann_count_rows = run_db("SELECT COUNT(*) FROM announcements WHERE guild_id = ?", (guild_id,))
-    ann_count = ann_count_rows[0][0] if ann_count_rows else 0
-    sched_count = pending_count(guild_id)
-    tpl_count = count_templates(guild_id)
-    glossary_cnt = count_glossary(guild_id)
-
-    limits = get_server_limits(guild_id)
-    cap = limits["daily_cap"]
-    pct_today = min(100, int((today_count / cap) * 100))
-    filled = int(pct_today / 10)
-    bar = "█" * filled + "░" * (10 - filled)
-
-    embed = discord.Embed(
-        title=f"📊 Translation Analytics • {interaction.guild.name}",
-        color=0xFEE75C if limits["is_premium"] else 0x5865F2,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(
-        name=f"📅 Today's Usage ({limits['badge']} {limits['plan_name']} Plan)",
-        value=f"**{today_count} / {cap}** new translations\n`[{bar}]` {pct_today}%",
-        inline=False,
-    )
-    embed.add_field(
-        name="📈 Past 7 Days",
-        value=history_text,
-        inline=True,
-    )
-    embed.add_field(
-        name="🌐 Top Languages",
-        value=top_langs_text,
-        inline=True,
-    )
-    embed.add_field(
-        name="📦 Server Content & Quotas",
-        value=(
-            f"⭐ **Plan:** {limits['badge']} **{limits['plan_name']}**\n"
-            f"📢 **Announcements posted:** {ann_count}\n"
-            f"📅 **Pending scheduled:** {sched_count}/{limits['max_scheduled']}\n"
-            f"📄 **Templates saved:** {tpl_count}/{limits['max_templates']}\n"
-            f"📖 **Glossary terms:** {glossary_cnt}/{limits['max_glossary']}"
-        ),
-        inline=False,
-    )
-
-    if OWNER_ID and interaction.user.id == OWNER_ID:
-        g_cnt = global_used_today()
-        g_pct = (g_cnt / GLOBAL_DAILY_CAP) * 100 if GLOBAL_DAILY_CAP > 0 else 0
         embed.add_field(
-            name="👑 Owner Global Usage",
-            value=f"**{g_cnt} / {GLOBAL_DAILY_CAP}** global translations today (`{g_pct:.1f}%`)",
+            name=f"📅 Today's Usage ({limits.get('badge', '🌱')} {limits.get('plan_name', 'Free')} Plan)",
+            value=f"**{today_count} / {cap}** new translations\n`[{bar}]` {pct_today}%",
             inline=False,
         )
-    embed.set_footer(text="🔒 Privacy protected: Counts only. Message text is never stored or tracked.")
+        embed.add_field(
+            name="📈 Past 7 Days",
+            value=history_text[:1024],
+            inline=True,
+        )
+        embed.add_field(
+            name="🌐 Top Languages",
+            value=top_langs_text[:1024],
+            inline=True,
+        )
+        embed.add_field(
+            name="📦 Server Content & Quotas",
+            value=(
+                f"⭐ **Plan:** {limits.get('badge', '🌱')} **{limits.get('plan_name', 'Free')}**\n"
+                f"📢 **Announcements posted:** {ann_count}\n"
+                f"📅 **Pending scheduled:** {sched_count}/{limits.get('max_scheduled', MAX_SCHEDULED)}\n"
+                f"📄 **Templates saved:** {tpl_count}/{limits.get('max_templates', MAX_TEMPLATES)}\n"
+                f"📖 **Glossary terms:** {glossary_cnt}/{limits.get('max_glossary', MAX_GLOSSARY)}"
+            )[:1024],
+            inline=False,
+        )
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+        if OWNER_ID and interaction.user.id == OWNER_ID:
+            g_cnt = global_used_today()
+            g_pct = (g_cnt / GLOBAL_DAILY_CAP) * 100 if GLOBAL_DAILY_CAP > 0 else 0
+            embed.add_field(
+                name="👑 Owner Global Usage",
+                value=f"**{g_cnt} / {GLOBAL_DAILY_CAP}** global translations today (`{g_pct:.1f}%`)",
+                inline=False,
+            )
+        embed.set_footer(text="🔒 Privacy protected: Counts only. Message text is never stored or tracked.")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        print(f"Error in /stats command: {e}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"❌ Failed to load server stats: {e}", ephemeral=True)
 
 
 # ---------- /language-roles group (Update 6) ----------
