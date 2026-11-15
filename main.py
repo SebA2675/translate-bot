@@ -181,6 +181,20 @@ def init_db():
         "CREATE TABLE IF NOT EXISTS settings ("
         "guild_id INTEGER PRIMARY KEY, log_channel_id INTEGER)"
     )
+    # update 5: server defaults (default announcement languages and translation style)
+    set_cols = [r[1] for r in run_db("PRAGMA table_info(settings)")]
+    if "default_languages" not in set_cols:
+        run_db("ALTER TABLE settings ADD COLUMN default_languages TEXT")
+    if "default_style" not in set_cols:
+        run_db("ALTER TABLE settings ADD COLUMN default_style TEXT")
+
+    # update 5: language usage counts for /stats (privacy-preserving, counts only)
+    run_db(
+        "CREATE TABLE IF NOT EXISTS language_usage ("
+        "guild_id INTEGER NOT NULL, lang TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (guild_id, lang))"
+    )
+
     run_db(
         "CREATE TABLE IF NOT EXISTS user_prefs ("
         "user_id INTEGER PRIMARY KEY, lang TEXT NOT NULL)"
@@ -292,7 +306,7 @@ def add_usage(guild_id):
     )
 
 
-# ---------- logs ----------
+# ---------- logs & settings helpers ----------
 def get_log_channel_id(guild_id):
     rows = run_db("SELECT log_channel_id FROM settings WHERE guild_id = ?", (guild_id,))
     return rows[0][0] if rows and rows[0][0] else None
@@ -351,7 +365,7 @@ async def notify_cap(interaction: discord.Interaction):
         )
 
 
-# ---------- who can use /send, /schedule, /template, /glossary ----------
+# ---------- who can use /send, /schedule, /template, /glossary, /settings, /stats ----------
 def can_send(interaction: discord.Interaction):
     member = interaction.user
     if member.guild_permissions.administrator:
@@ -359,6 +373,94 @@ def can_send(interaction: discord.Interaction):
     rows = run_db("SELECT role_id FROM allowed_roles WHERE guild_id = ?", (interaction.guild_id,))
     allowed = {r[0] for r in rows}
     return any(role.id in allowed for role in member.roles)
+
+
+# ---------- server settings & defaults (Update 5) ----------
+def get_settings(guild_id: int):
+    rows = run_db(
+        "SELECT log_channel_id, default_languages, default_style FROM settings WHERE guild_id = ?",
+        (guild_id,),
+    )
+    if rows:
+        log_ch, def_langs_json, def_style = rows[0]
+        def_langs = json.loads(def_langs_json) if def_langs_json else []
+        return log_ch, def_langs, def_style or "natural"
+    return None, [], "natural"
+
+
+def get_default_languages(guild_id: Optional[int]) -> list[str]:
+    if not guild_id:
+        return []
+    rows = run_db("SELECT default_languages FROM settings WHERE guild_id = ?", (guild_id,))
+    if rows and rows[0][0]:
+        try:
+            langs = json.loads(rows[0][0])
+            if isinstance(langs, list):
+                return [c for c in langs if c in ALL_CODES]
+        except Exception:
+            pass
+    return []
+
+
+def set_default_languages(guild_id: int, languages: list[str]):
+    langs_json = json.dumps(languages[:25]) if languages else None
+    run_db(
+        "INSERT INTO settings (guild_id, default_languages) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET default_languages = excluded.default_languages",
+        (guild_id, langs_json),
+    )
+
+
+def get_default_style(guild_id: Optional[int]) -> str:
+    if not guild_id:
+        return "natural"
+    rows = run_db("SELECT default_style FROM settings WHERE guild_id = ?", (guild_id,))
+    if rows and rows[0][0]:
+        return rows[0][0]
+    return "natural"
+
+
+def set_default_style(guild_id: int, style: str):
+    valid_style = style if style in STYLE_HINTS else "natural"
+    run_db(
+        "INSERT INTO settings (guild_id, default_style) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET default_style = excluded.default_style",
+        (guild_id, valid_style),
+    )
+
+
+def reset_server_settings(guild_id: int):
+    run_db(
+        "UPDATE settings SET default_languages = NULL, default_style = 'natural' WHERE guild_id = ?",
+        (guild_id,),
+    )
+
+
+# ---------- language usage & analytics (Update 5: counts only, privacy-safe) ----------
+def bump_language_usage(guild_id: Optional[int], lang: str):
+    if not guild_id or not lang:
+        return
+    run_db(
+        "INSERT INTO language_usage (guild_id, lang, count) VALUES (?, ?, 1) "
+        "ON CONFLICT(guild_id, lang) DO UPDATE SET count = count + 1",
+        (guild_id, lang),
+    )
+
+
+def get_top_languages(guild_id: int, limit: int = 10):
+    """Returns [(lang, count), ...] sorted by count descending."""
+    return run_db(
+        "SELECT lang, count FROM language_usage WHERE guild_id = ? ORDER BY count DESC LIMIT ?",
+        (guild_id, limit),
+    )
+
+
+def get_daily_usage_history(guild_id: int, days: int = 7):
+    """Returns [(day, count), ...] for recent days, sorted descending."""
+    return run_db(
+        "SELECT day, count FROM usage WHERE guild_id = ? ORDER BY day DESC LIMIT ?",
+        (guild_id, days),
+    )
 
 
 # ---------- glossary helpers (Update 4) ----------
@@ -586,6 +688,7 @@ async def _translate_uncached(guild_id, message_id, text, code, g_hash):
         (message_id, code, result, g_hash),
     )
     add_usage(guild_id)
+    bump_language_usage(guild_id, code)
     return result
 
 
@@ -627,6 +730,7 @@ async def _translate_text_uncached(guild_id, text_hash, text, code, style):
         (text_hash, code, style, result),
     )
     add_usage(guild_id)
+    bump_language_usage(guild_id, code)
     return result
 
 
@@ -881,13 +985,13 @@ def language_select_options():
 class PickOptionsView(discord.ui.View):
     """Step 2 of /send: pick languages, extra channels, optional role and link buttons."""
 
-    def __init__(self, primary_channel, text, image_proxy_url=None, image_name=None):
+    def __init__(self, primary_channel, text, image_proxy_url=None, image_name=None, default_langs=None):
         super().__init__(timeout=300)
         self.primary_channel = primary_channel
         self.text = text
         self.image_proxy_url = image_proxy_url   # download at post time
         self.image_name = image_name
-        self.chosen_langs = []        # list of lang codes (empty = all 25)
+        self.chosen_langs = list(default_langs) if default_langs else []
         self.extra_channels = []      # list of PartialInteractionChannel / TextChannel objects
         self.ping_role = None         # discord.Role or None
         self.link_buttons = []        # list of {"label": str, "url": str}
@@ -1073,7 +1177,8 @@ class AnnouncementModal(discord.ui.Modal, title="New announcement"):
         self.image_name = image_name
 
     async def on_submit(self, interaction: discord.Interaction):
-        view = PickOptionsView(self.channel, self.message.value, self.image_proxy_url, self.image_name)
+        def_langs = get_default_languages(interaction.guild_id)
+        view = PickOptionsView(self.channel, self.message.value, self.image_proxy_url, self.image_name, default_langs=def_langs)
         await interaction.response.send_message(
             "Adjust options below, then press **Preview & Post**.",
             view=view,
@@ -1120,12 +1225,12 @@ def finish_scheduled(sid, status, note=None):
 class SchedulePickView(discord.ui.View):
     """Step 2 of /schedule: pick languages, extra channels, optional role and link buttons."""
 
-    def __init__(self, primary_channel, text, post_at):
+    def __init__(self, primary_channel, text, post_at, default_langs=None):
         super().__init__(timeout=300)
         self.primary_channel = primary_channel
         self.text = text
         self.post_at = post_at
-        self.chosen_langs = []
+        self.chosen_langs = list(default_langs) if default_langs else []
         self.extra_channels = []
         self.ping_role = None
         self.link_buttons = []
@@ -1344,7 +1449,8 @@ class ScheduleModal(discord.ui.Modal, title="Schedule announcement"):
                 ephemeral=True,
             )
             return
-        view = SchedulePickView(self.channel, self.message.value, post_at)
+        def_langs = get_default_languages(interaction.guild_id)
+        view = SchedulePickView(self.channel, self.message.value, post_at, default_langs=def_langs)
         await interaction.response.send_message(
             f"📅 <t:{post_at}:F> (<t:{post_at}:R>) in {self.channel.mention}.\n"
             f"Discord shows that time in **your** local time — check that it's right. "
@@ -1478,7 +1584,7 @@ def panel_text(guild_id):
     log_line = f"<#{log_id}>" if log_id else "Not set"
     return (
         "**🔑 Manager access**\n"
-        "Roles that can use `/send` and `/schedule`:\n"
+        "Roles that can use `/send`, `/schedule`, `/settings`, `/stats`:\n"
         f"{roles}\n\n"
         "Administrators can always use them.\n"
         f"📝 Log channel: {log_line}\n"
@@ -1649,6 +1755,171 @@ class LogChannelView(AdminOnlyView):
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             content=panel_text(interaction.guild_id), view=ManagerPanelView()
+        )
+
+
+# ---------- /settings views (Update 5: admins & managers) ----------
+def settings_panel_text(guild_id: int) -> str:
+    log_ch, def_langs, def_style = get_settings(guild_id)
+    log_line = f"<#{log_ch}>" if log_ch else "*Not set*"
+
+    if def_langs:
+        lang_items = []
+        for c in def_langs[:8]:
+            if c in LANG_BY_CODE:
+                lang_items.append(f"{LANG_BY_CODE[c][1]} {LANG_BY_CODE[c][0]}")
+            else:
+                lang_items.append(c)
+        if len(def_langs) > 8:
+            lang_items.append(f"+{len(def_langs) - 8} more")
+        langs_str = ", ".join(lang_items)
+    else:
+        langs_str = "All 25 languages (default)"
+
+    style_name = def_style.capitalize() if def_style else "Natural"
+
+    return (
+        "⚙️ **Server Settings & Defaults**\n\n"
+        f"🌐 **Default Announcement Languages:**\n> {langs_str}\n\n"
+        f"🎭 **Default Translation Style:** `{style_name}`\n\n"
+        f"📝 **Log Channel:** {log_line}\n\n"
+        f"📊 **Today's Translation Usage:** **{used_today(guild_id)} / {DAILY_CAP}** (resets midnight UTC)\n\n"
+        "*Choose an option below to update defaults for `/send`, `/schedule`, and `/translate`:*"
+    )
+
+
+class SettingsPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if can_send(interaction):
+            return True
+        await interaction.response.send_message(
+            "Only administrators and managers can change server settings.", ephemeral=True
+        )
+        return False
+
+    @discord.ui.button(label="Default Languages", style=discord.ButtonStyle.primary, emoji="🌐")
+    async def set_languages(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="🌐 **Select the default languages to offer under announcements**:\n*(Leave blank or choose Clear to offer all 25)*",
+            view=DefaultLanguagesView(),
+        )
+
+    @discord.ui.button(label="Default Style", style=discord.ButtonStyle.secondary, emoji="🎭")
+    async def set_style(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="🎭 **Choose the default translation style for this server**:",
+            view=DefaultStyleView(),
+        )
+
+    @discord.ui.button(label="Reset Defaults", style=discord.ButtonStyle.danger, emoji="↺")
+    async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        reset_server_settings(interaction.guild_id)
+        await interaction.response.edit_message(
+            content=settings_panel_text(interaction.guild_id),
+            view=SettingsPanelView(),
+        )
+        await send_log(
+            interaction.guild,
+            "⚙️ Server defaults reset",
+            f"Defaults restored to factory settings.\n**By:** {interaction.user.mention}",
+            color=0xFEE75C,
+        )
+
+
+class DefaultLanguagesView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if can_send(interaction):
+            return True
+        await interaction.response.send_message("Only managers can do this.", ephemeral=True)
+        return False
+
+    @discord.ui.select(
+        placeholder="Choose default languages (up to 25)…",
+        min_values=1,
+        max_values=25,
+        options=language_select_options(),
+    )
+    async def pick_langs(self, interaction: discord.Interaction, select: discord.ui.Select):
+        chosen = list(select.values)
+        set_default_languages(interaction.guild_id, chosen)
+        await interaction.response.edit_message(
+            content=settings_panel_text(interaction.guild_id),
+            view=SettingsPanelView(),
+        )
+        await send_log(
+            interaction.guild,
+            "⚙️ Default announcement languages updated",
+            f"Now offering {len(chosen)} default languages.\n**By:** {interaction.user.mention}",
+            color=0x57F287,
+        )
+
+    @discord.ui.button(label="Clear (Use All 25)", style=discord.ButtonStyle.secondary)
+    async def clear_langs(self, interaction: discord.Interaction, button: discord.ui.Button):
+        set_default_languages(interaction.guild_id, [])
+        await interaction.response.edit_message(
+            content=settings_panel_text(interaction.guild_id),
+            view=SettingsPanelView(),
+        )
+        await send_log(
+            interaction.guild,
+            "⚙️ Default languages reset",
+            f"Announcements will offer all 25 languages by default.\n**By:** {interaction.user.mention}",
+            color=0xFEE75C,
+        )
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=settings_panel_text(interaction.guild_id),
+            view=SettingsPanelView(),
+        )
+
+
+class DefaultStyleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if can_send(interaction):
+            return True
+        await interaction.response.send_message("Only managers can do this.", ephemeral=True)
+        return False
+
+    @discord.ui.select(
+        placeholder="Choose default style…",
+        min_values=1,
+        max_values=1,
+        options=[
+            discord.SelectOption(label="Natural", value="natural", description="Idiomatic, native-like phrasing (recommended)"),
+            discord.SelectOption(label="Formal", value="formal", description="Professional, polite tone"),
+            discord.SelectOption(label="Casual", value="casual", description="Relaxed, conversational tone"),
+        ],
+    )
+    async def pick_style(self, interaction: discord.Interaction, select: discord.ui.Select):
+        style = select.values[0]
+        set_default_style(interaction.guild_id, style)
+        await interaction.response.edit_message(
+            content=settings_panel_text(interaction.guild_id),
+            view=SettingsPanelView(),
+        )
+        await send_log(
+            interaction.guild,
+            "⚙️ Default translation style updated",
+            f"Set to **{style.capitalize()}**.\n**By:** {interaction.user.mention}",
+            color=0x57F287,
+        )
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=settings_panel_text(interaction.guild_id),
+            view=SettingsPanelView(),
         )
 
 
@@ -1904,7 +2175,9 @@ async def help_command(interaction: discord.Interaction):
         "• `/template use [name] [channel]`: start `/send` pre-filled from a saved template.\n"
         "• `/template delete [name]`: remove a saved template.\n"
         "• `/glossary add [term] [replacement?] [language?]`: set terms that stay untranslated or always translate a fixed way.\n"
-        "• `/glossary list` / `/glossary remove` / `/glossary clear`: manage your server's custom glossary terms.\n"
+        "• `/glossary list` / `/glossary remove` / `/glossary clear`: manage server custom glossary terms.\n"
+        "• `/settings`: configure server defaults (default announcement languages, translation tone).\n"
+        "• `/stats`: view translation activity, daily usage breakdown, and top requested languages.\n"
         "• `/manager-access`: choose which roles can use these commands, and set a private "
         "log channel (administrators only).\n\n"
         "**Setup tips**\n"
@@ -2011,8 +2284,9 @@ async def translate_command(
             ephemeral=True,
         )
         return
+    chosen_style = style or get_default_style(interaction.guild_id)
     await interaction.response.defer(ephemeral=True, thinking=True)
-    await reply_with_translation(interaction, text, code, style or "natural")
+    await reply_with_translation(interaction, text, code, chosen_style)
 
 
 @bot.tree.command(name="send", description="Post an announcement with a translation menu")
@@ -2112,6 +2386,109 @@ async def manager_access(interaction: discord.Interaction):
     await interaction.response.send_message(
         panel_text(interaction.guild_id), view=ManagerPanelView(), ephemeral=True
     )
+
+
+# ---------- /settings & /stats commands (Update 5) ----------
+@bot.tree.command(name="settings", description="Configure server defaults (announcement languages, tone)")
+@app_commands.guild_only()
+async def settings_command(interaction: discord.Interaction):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to manage settings. "
+            "Ask an admin to add your role with `/manager-access`.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        settings_panel_text(interaction.guild_id),
+        view=SettingsPanelView(),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="stats", description="View translation activity and top languages for this server")
+@app_commands.guild_only()
+async def stats_command(interaction: discord.Interaction):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to view stats. "
+            "Ask an admin to add your role with `/manager-access`.",
+            ephemeral=True,
+        )
+        return
+
+    guild_id = interaction.guild_id
+    today_count = used_today(guild_id)
+    history = get_daily_usage_history(guild_id, 7)
+    top_langs = get_top_languages(guild_id, 8)
+
+    # 7-day total
+    week_total = sum(c for _, c in history)
+
+    # 7-day history text
+    if history:
+        history_lines = [f"• `{d}`: **{c}**" for d, c in history]
+        history_text = "\n".join(history_lines) + f"\n*7-day total: **{week_total}** translations*"
+    else:
+        history_text = "*No translations recorded in the past 7 days.*"
+
+    # Top languages
+    total_lang_count = sum(c for _, c in top_langs)
+    if top_langs and total_lang_count > 0:
+        lang_lines = []
+        for i, (code, count) in enumerate(top_langs, 1):
+            name, flag = LANG_BY_CODE.get(code, (code, "🌐"))
+            pct = int((count / total_lang_count) * 100)
+            lang_lines.append(f"{i}. {flag} **{name}**: {count} `({pct}%)`")
+        top_langs_text = "\n".join(lang_lines)
+    else:
+        top_langs_text = "*No language data recorded yet.*"
+
+    # Server content stats
+    ann_count_rows = run_db("SELECT COUNT(*) FROM announcements WHERE guild_id = ?", (guild_id,))
+    ann_count = ann_count_rows[0][0] if ann_count_rows else 0
+    sched_count = pending_count(guild_id)
+    tpl_count = count_templates(guild_id)
+    glossary_cnt = count_glossary(guild_id)
+
+    # Progress bar for today's cap
+    pct_today = min(100, int((today_count / DAILY_CAP) * 100))
+    filled = int(pct_today / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+
+    embed = discord.Embed(
+        title=f"📊 Translation Analytics • {interaction.guild.name}",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="📅 Today's Usage (UTC)",
+        value=f"**{today_count} / {DAILY_CAP}** new translations\n`[{bar}]` {pct_today}%",
+        inline=False,
+    )
+    embed.add_field(
+        name="📈 Past 7 Days",
+        value=history_text,
+        inline=True,
+    )
+    embed.add_field(
+        name="🌐 Top Languages",
+        value=top_langs_text,
+        inline=True,
+    )
+    embed.add_field(
+        name="📦 Server Content",
+        value=(
+            f"📢 **Announcements posted:** {ann_count}\n"
+            f"📅 **Pending scheduled:** {sched_count}/{MAX_SCHEDULED}\n"
+            f"📄 **Templates saved:** {tpl_count}/{MAX_TEMPLATES}\n"
+            f"📖 **Glossary terms:** {glossary_cnt}/{MAX_GLOSSARY}"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="🔒 Privacy protected: Counts only. Message text is never stored or tracked.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ---------- /template group ----------
