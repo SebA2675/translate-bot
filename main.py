@@ -1,15 +1,17 @@
 import os
+import re
 import json
 import time
 import asyncio
 import hashlib
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiohttp
 import discord
 from discord import app_commands
+from discord.ext import tasks
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -24,6 +26,8 @@ TRANSLATOR_ORDER = [
 ]
 DAILY_CAP = int(os.environ.get("DAILY_CAP", "100"))              # new translations per server per day
 COOLDOWN_SECONDS = float(os.environ.get("COOLDOWN_SECONDS", "5"))  # per user between requests
+MAX_SCHEDULED = int(os.environ.get("MAX_SCHEDULED", "10"))        # pending scheduled announcements per server
+MISSED_GRACE_MINUTES = int(os.environ.get("MISSED_GRACE_MINUTES", "60"))  # how late a scheduled post may still go out
 MAX_TRANSLATE_CHARS = 4000                                        # longest text we translate on request
 DB_PATH = "bot.db"
 
@@ -150,6 +154,20 @@ def init_db():
     run_db(
         "CREATE TABLE IF NOT EXISTS user_prefs ("
         "user_id INTEGER PRIMARY KEY, lang TEXT NOT NULL)"
+    )
+    # update 2: scheduled announcements
+    run_db(
+        "CREATE TABLE IF NOT EXISTS scheduled ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, "
+        "channel_id INTEGER NOT NULL, created_by INTEGER NOT NULL, text TEXT NOT NULL, "
+        "languages TEXT NOT NULL, post_at INTEGER NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'pending', note TEXT)"
+    )
+    # a post that was in progress when the bot restarted may or may not have gone out
+    run_db(
+        "UPDATE scheduled SET status = 'failed', "
+        "note = 'Interrupted by a restart. Please check the channel.' "
+        "WHERE status = 'posting'"
     )
 
 
@@ -564,7 +582,40 @@ class TranslateView(discord.ui.View):
         self.add_item(LanguageSelect(codes))
 
 
+# ---------- posting an announcement (used by /send and by the scheduler) ----------
+async def publish_announcement(channel, text, offered):
+    """Detects the language, posts the announcement with its dropdown and saves it.
+
+    Returns (message, codes_offered, source_language). May raise discord.Forbidden / HTTPException.
+    """
+    offered = offered or ALL_CODES
+    source = await detect_language(text)
+    codes = [c for c in offered if c != source]
+    if not codes:          # never leave the dropdown empty
+        codes = offered
+    msg = await channel.send(content=text, view=TranslateView(codes))
+    run_db(
+        "INSERT OR REPLACE INTO announcements (message_id, text, languages, source_lang) "
+        "VALUES (?, ?, ?, ?)",
+        (msg.id, text, json.dumps(codes), source),
+    )
+    return msg, codes, source
+
+
+def original_language_line(source):
+    if source in LANG_BY_CODE:
+        return f"**Original language:** {LANG_BY_CODE[source][1]} {LANG_BY_CODE[source][0]}\n"
+    return ""
+
+
 # ---------- /send: modal -> language picker -> post ----------
+def language_select_options():
+    return [
+        discord.SelectOption(label=name, value=code, emoji=flag)
+        for code, name, flag in LANGUAGES
+    ]
+
+
 class PickLanguagesView(discord.ui.View):
     def __init__(self, channel, text):
         super().__init__(timeout=300)
@@ -576,10 +627,7 @@ class PickLanguagesView(discord.ui.View):
         placeholder="Languages to offer (leave empty = all 25)",
         min_values=0,
         max_values=25,
-        options=[
-            discord.SelectOption(label=name, value=code, emoji=flag)
-            for code, name, flag in LANGUAGES
-        ],
+        options=language_select_options(),
     )
     async def pick(self, interaction: discord.Interaction, select: discord.ui.Select):
         self.chosen = list(select.values)
@@ -589,39 +637,25 @@ class PickLanguagesView(discord.ui.View):
     async def post(self, interaction: discord.Interaction, button: discord.ui.Button):
         # detecting the language takes a moment, so tell Discord we're working on it
         await interaction.response.defer()
-
-        offered = self.chosen or ALL_CODES
-        source = await detect_language(self.text)
-        codes = [c for c in offered if c != source]
-        if not codes:          # never leave the dropdown empty
-            codes = offered
-
         try:
-            msg = await self.channel.send(content=self.text, view=TranslateView(codes))
+            msg, codes, source = await publish_announcement(
+                self.channel, self.text, self.chosen or ALL_CODES
+            )
         except discord.Forbidden:
             await interaction.edit_original_response(
                 content="I can't post in that channel. Please check my permissions there.",
                 view=None,
             )
             return
-        run_db(
-            "INSERT OR REPLACE INTO announcements (message_id, text, languages, source_lang) "
-            "VALUES (?, ?, ?, ?)",
-            (msg.id, self.text, json.dumps(codes), source),
-        )
         await interaction.edit_original_response(
             content=f"✅ Posted in {self.channel.mention}", view=None
-        )
-        source_line = (
-            f"**Original language:** {LANG_BY_CODE[source][1]} {LANG_BY_CODE[source][0]}\n"
-            if source in LANG_BY_CODE else ""
         )
         await send_log(
             interaction.guild,
             "📢 Announcement posted",
             f"**By:** {interaction.user.mention}\n"
             f"**Channel:** {self.channel.mention}\n"
-            f"{source_line}"
+            f"{original_language_line(source)}"
             f"**Languages offered:** {len(codes)}\n"
             f"**Message:** [Jump to announcement]({msg.jump_url})\n\n"
             f"> {preview(self.text)}",
@@ -649,6 +683,255 @@ class AnnouncementModal(discord.ui.Modal, title="New announcement"):
         )
 
 
+# ---------- scheduled announcements ----------
+OFFSET_RE = re.compile(r"^([+-])(\d{1,2})(?::?(\d{2}))?$")
+
+
+def parse_when(date_s, time_s, offset_s):
+    """Returns (unix_timestamp, error_message). One of them is None."""
+    try:
+        naive = datetime.strptime(f"{date_s.strip()} {time_s.strip()}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None, "The date must look like `2026-12-25` and the time like `18:30` (24-hour)."
+    raw = (offset_s or "").strip().lower().replace("utc", "").replace("gmt", "").strip()
+    if raw in ("", "z"):
+        raw = "+00:00"
+    m = OFFSET_RE.match(raw)
+    if not m:
+        return None, "The UTC offset must look like `+05:30`, `-04:00` or `+00:00`."
+    sign = 1 if m.group(1) == "+" else -1
+    hours = int(m.group(2))
+    minutes = int(m.group(3) or 0)
+    if hours > 14 or minutes > 59:
+        return None, "That UTC offset isn't valid."
+    tz = timezone(sign * timedelta(hours=hours, minutes=minutes))
+    return int(naive.replace(tzinfo=tz).timestamp()), None
+
+
+def pending_count(guild_id):
+    rows = run_db(
+        "SELECT COUNT(*) FROM scheduled WHERE guild_id = ? AND status = 'pending'", (guild_id,)
+    )
+    return rows[0][0] if rows else 0
+
+
+def finish_scheduled(sid, status, note=None):
+    run_db("UPDATE scheduled SET status = ?, note = ? WHERE id = ?", (status, note, sid))
+
+
+class ScheduleLanguagesView(discord.ui.View):
+    def __init__(self, channel, text, post_at):
+        super().__init__(timeout=300)
+        self.channel = channel
+        self.text = text
+        self.post_at = post_at
+        self.chosen = []
+
+    @discord.ui.select(
+        placeholder="Languages to offer (leave empty = all 25)",
+        min_values=0,
+        max_values=25,
+        options=language_select_options(),
+    )
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.chosen = list(select.values)
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Schedule announcement", style=discord.ButtonStyle.success, emoji="📅")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if pending_count(interaction.guild_id) >= MAX_SCHEDULED:
+            await interaction.response.edit_message(
+                content=f"This server already has {MAX_SCHEDULED} scheduled announcements, which is the limit. "
+                        f"Cancel one with `/scheduled` first.",
+                view=None,
+            )
+            return
+        if self.post_at < int(time.time()) + 30:
+            await interaction.response.edit_message(
+                content="That time has already passed. Please run `/schedule` again.", view=None
+            )
+            return
+        run_db(
+            "INSERT INTO scheduled (guild_id, channel_id, created_by, text, languages, post_at, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+            (
+                interaction.guild_id, self.channel.id, interaction.user.id, self.text,
+                json.dumps(self.chosen), self.post_at,
+            ),
+        )
+        await interaction.response.edit_message(
+            content=f"✅ Scheduled for <t:{self.post_at}:F> (<t:{self.post_at}:R>) in {self.channel.mention}.\n"
+                    f"See or cancel it with `/scheduled`.",
+            view=None,
+        )
+        await send_log(
+            interaction.guild,
+            "📅 Announcement scheduled",
+            f"**By:** {interaction.user.mention}\n"
+            f"**Channel:** {self.channel.mention}\n"
+            f"**Posts at:** <t:{self.post_at}:F> (<t:{self.post_at}:R>)\n\n"
+            f"> {preview(self.text)}",
+            color=0x57F287,
+        )
+
+
+class ScheduleModal(discord.ui.Modal, title="Schedule announcement"):
+    date = discord.ui.TextInput(
+        label="Date (YYYY-MM-DD)", placeholder="2026-12-25", min_length=10, max_length=10
+    )
+    clock = discord.ui.TextInput(
+        label="Time (24-hour, HH:MM)", placeholder="18:30", min_length=4, max_length=5
+    )
+    offset = discord.ui.TextInput(
+        label="Your UTC offset (blank = UTC)", placeholder="+05:30", required=False, max_length=8
+    )
+    message = discord.ui.TextInput(
+        label="Announcement",
+        style=discord.TextStyle.paragraph,
+        max_length=2000,
+        placeholder="Type your announcement here…",
+    )
+
+    def __init__(self, channel):
+        super().__init__()
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction):
+        post_at, err = parse_when(self.date.value, self.clock.value, self.offset.value)
+        if err:
+            await interaction.response.send_message(f"⚠️ {err}", ephemeral=True)
+            return
+        now = int(time.time())
+        if post_at < now + 60:
+            await interaction.response.send_message(
+                "⚠️ The time must be at least 1 minute in the future.", ephemeral=True
+            )
+            return
+        if post_at > now + 365 * 86400:
+            await interaction.response.send_message(
+                "⚠️ You can schedule up to one year ahead.", ephemeral=True
+            )
+            return
+        if pending_count(interaction.guild_id) >= MAX_SCHEDULED:
+            await interaction.response.send_message(
+                f"⚠️ This server already has {MAX_SCHEDULED} scheduled announcements, which is the limit. "
+                f"Cancel one with `/scheduled` first.",
+                ephemeral=True,
+            )
+            return
+        view = ScheduleLanguagesView(self.channel, self.message.value, post_at)
+        await interaction.response.send_message(
+            f"📅 This will post in {self.channel.mention} on <t:{post_at}:F> (<t:{post_at}:R>).\n"
+            f"Discord shows that time in **your** local time, so check that it's what you meant. "
+            f"Then choose languages (leave empty for all) and press **Schedule announcement**.",
+            view=view,
+            ephemeral=True,
+        )
+
+
+def utc_text(post_at):
+    return datetime.fromtimestamp(post_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def render_scheduled(guild_id):
+    """Returns (message_text, view_or_None) for the /scheduled list."""
+    rows = run_db(
+        "SELECT id, channel_id, created_by, text, post_at FROM scheduled "
+        "WHERE guild_id = ? AND status = 'pending' ORDER BY post_at LIMIT 10",
+        (guild_id,),
+    )
+    if not rows:
+        return "📅 No scheduled announcements. Create one with `/schedule`.", None
+    lines = [
+        f"**#{r[0]}** · <t:{r[4]}:f> · <#{r[1]}>\n> {preview(r[3], 80)}" for r in rows
+    ]
+    content = "📅 **Scheduled announcements**\n\n" + "\n".join(lines) + "\n\nPick one below to see it or cancel it."
+    return content, ScheduledListView(rows)
+
+
+class ScheduledListView(discord.ui.View):
+    def __init__(self, rows):
+        super().__init__(timeout=300)
+        options = [
+            discord.SelectOption(
+                label=f"#{r[0]} · {preview(r[3], 60)}"[:100],
+                value=str(r[0]),
+                description=utc_text(r[4]),
+            )
+            for r in rows
+        ]
+        select = discord.ui.Select(placeholder="Choose an announcement", options=options)
+        select.callback = self.on_pick
+        self.add_item(select)
+
+    async def on_pick(self, interaction: discord.Interaction):
+        sid = int(interaction.data["values"][0])
+        rows = run_db(
+            "SELECT channel_id, created_by, text, post_at, status FROM scheduled "
+            "WHERE id = ? AND guild_id = ?",
+            (sid, interaction.guild_id),
+        )
+        if not rows or rows[0][4] != "pending":
+            content, view = render_scheduled(interaction.guild_id)
+            await interaction.response.edit_message(
+                content="That announcement is no longer pending.\n\n" + content, view=view
+            )
+            return
+        channel_id, created_by, text, post_at, _status = rows[0]
+        await interaction.response.edit_message(
+            content=(
+                f"📅 **Scheduled announcement #{sid}**\n"
+                f"**When:** <t:{post_at}:F> (<t:{post_at}:R>)\n"
+                f"**Channel:** <#{channel_id}>\n"
+                f"**Created by:** <@{created_by}>\n\n"
+                f"{preview(text, 1500)}"
+            ),
+            view=ScheduledDetailView(sid, created_by),
+        )
+
+
+class ScheduledDetailView(discord.ui.View):
+    def __init__(self, sid, created_by):
+        super().__init__(timeout=300)
+        self.sid = sid
+        self.created_by = created_by
+
+    @discord.ui.button(label="Cancel this announcement", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        is_admin = interaction.user.guild_permissions.administrator
+        if not (is_admin or interaction.user.id == self.created_by):
+            await interaction.response.send_message(
+                "Only administrators or the person who scheduled it can cancel it.", ephemeral=True
+            )
+            return
+        rows = run_db(
+            "SELECT text FROM scheduled WHERE id = ? AND guild_id = ? AND status = 'pending'",
+            (self.sid, interaction.guild_id),
+        )
+        if not rows:
+            content, view = render_scheduled(interaction.guild_id)
+            await interaction.response.edit_message(
+                content="That announcement is no longer pending.\n\n" + content, view=view
+            )
+            return
+        finish_scheduled(self.sid, "cancelled", f"Cancelled by {interaction.user.id}")
+        content, view = render_scheduled(interaction.guild_id)
+        await interaction.response.edit_message(
+            content=f"✅ Announcement #{self.sid} was cancelled.\n\n" + content, view=view
+        )
+        await send_log(
+            interaction.guild,
+            "🗑️ Scheduled announcement cancelled",
+            f"**By:** {interaction.user.mention}\n**Announcement:** #{self.sid}\n\n> {preview(rows[0][0])}",
+            color=0xFEE75C,
+        )
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        content, view = render_scheduled(interaction.guild_id)
+        await interaction.response.edit_message(content=content, view=view)
+
+
 # ---------- /manager-access panel (admins only) ----------
 def panel_text(guild_id):
     rows = run_db("SELECT role_id FROM allowed_roles WHERE guild_id = ?", (guild_id,))
@@ -660,9 +943,9 @@ def panel_text(guild_id):
     log_line = f"<#{log_id}>" if log_id else "Not set"
     return (
         "**🔑 Manager access**\n"
-        "Roles that can use `/send`:\n"
+        "Roles that can use `/send` and `/schedule`:\n"
         f"{roles}\n\n"
-        "Administrators can always use it.\n"
+        "Administrators can always use them.\n"
         f"📝 Log channel: {log_line}\n"
         f"📊 New translations today (UTC): **{used_today(guild_id)} / {DAILY_CAP}**"
     )
@@ -735,7 +1018,7 @@ class AddRoleView(AdminOnlyView):
         await send_log(
             interaction.guild,
             "➕ Manager role added",
-            f"{role.mention} can now use `/send`.\n**By:** {interaction.user.mention}",
+            f"{role.mention} can now use `/send` and `/schedule`.\n**By:** {interaction.user.mention}",
             color=0x57F287,
         )
 
@@ -773,7 +1056,7 @@ class RemoveRoleView(AdminOnlyView):
         await send_log(
             interaction.guild,
             "➖ Manager role removed",
-            f"<@&{role_id}> can no longer use `/send`.\n**By:** {interaction.user.mention}",
+            f"<@&{role_id}> can no longer use `/send` and `/schedule`.\n**By:** {interaction.user.mention}",
             color=0xFEE75C,
         )
 
@@ -844,9 +1127,91 @@ class TranslateBot(discord.Client):
         init_db()
         self.add_view(TranslateView())  # keeps old dropdowns working after restarts
         await self.tree.sync()
+        scheduler_loop.start()
 
 
 bot = TranslateBot()
+
+
+# ---------- the scheduler: runs every 30 seconds ----------
+@tasks.loop(seconds=30)
+async def scheduler_loop():
+    try:
+        now = int(time.time())
+        due = run_db(
+            "SELECT id, guild_id, channel_id, created_by, text, languages, post_at FROM scheduled "
+            "WHERE status = 'pending' AND post_at <= ? ORDER BY post_at LIMIT 20",
+            (now,),
+        )
+        for sid, guild_id, channel_id, created_by, text, langs_json, post_at in due:
+            # claim it first, so it can never be posted twice
+            run_db("UPDATE scheduled SET status = 'posting' WHERE id = ?", (sid,))
+            guild = bot.get_guild(guild_id)
+
+            if now - post_at > MISSED_GRACE_MINUTES * 60:
+                finish_scheduled(sid, "missed", "The bot was offline for too long")
+                await send_log(
+                    guild,
+                    "⚠️ Scheduled announcement missed",
+                    f"Announcement **#{sid}** was due <t:{post_at}:F> but the bot was offline for too long, "
+                    f"so it was **not** posted. Schedule it again if you still need it.\n\n> {preview(text)}",
+                    color=0xED4245,
+                )
+                continue
+
+            channel = guild.get_channel(channel_id) if guild else None
+            if channel is None:
+                finish_scheduled(sid, "failed", "Channel or server not found")
+                await send_log(
+                    guild,
+                    "⚠️ Scheduled announcement failed",
+                    f"Announcement **#{sid}** could not be posted, because the channel was not found.\n\n"
+                    f"> {preview(text)}",
+                    color=0xED4245,
+                )
+                continue
+
+            try:
+                offered = json.loads(langs_json) or ALL_CODES
+                msg, codes, source = await publish_announcement(channel, text, offered)
+            except discord.Forbidden:
+                finish_scheduled(sid, "failed", "Missing permission in the channel")
+                await send_log(
+                    guild,
+                    "⚠️ Scheduled announcement failed",
+                    f"Announcement **#{sid}** could not be posted in {channel.mention}: "
+                    f"I'm missing permission to post there.\n\n> {preview(text)}",
+                    color=0xED4245,
+                )
+            except discord.HTTPException as e:
+                finish_scheduled(sid, "failed", f"Discord error {e.status}")
+                await send_log(
+                    guild,
+                    "⚠️ Scheduled announcement failed",
+                    f"Announcement **#{sid}** could not be posted in {channel.mention} "
+                    f"(Discord error {e.status}).\n\n> {preview(text)}",
+                    color=0xED4245,
+                )
+            else:
+                finish_scheduled(sid, "done")
+                await send_log(
+                    guild,
+                    "⏰ Scheduled announcement posted",
+                    f"**Scheduled by:** <@{created_by}>\n"
+                    f"**Channel:** {channel.mention}\n"
+                    f"{original_language_line(source)}"
+                    f"**Languages offered:** {len(codes)}\n"
+                    f"**Message:** [Jump to announcement]({msg.jump_url})\n\n"
+                    f"> {preview(text)}",
+                    color=0x57F287,
+                )
+    except Exception as e:
+        print(f"Scheduler error: {e!r}")
+
+
+@scheduler_loop.before_loop
+async def before_scheduler():
+    await bot.wait_until_ready()
 
 
 @bot.event
@@ -874,7 +1239,9 @@ async def help_command(interaction: discord.Interaction):
         "**For admins and managers**\n"
         "• `/send`: post an announcement with a translation menu "
         "(administrators and manager roles)\n"
-        "• `/manager-access`: choose which roles can use `/send`, and set a private "
+        "• `/schedule`: post an announcement later, at a date and time you choose\n"
+        "• `/scheduled`: see or cancel scheduled announcements\n"
+        "• `/manager-access`: choose which roles can use these commands, and set a private "
         "log channel (administrators only)\n\n"
         "**Setup tips**\n"
         "• The bot needs **View Channel**, **Send Messages** and **Embed Links** in the "
@@ -996,6 +1363,49 @@ async def send(interaction: discord.Interaction, channel: discord.TextChannel):
         )
         return
     await interaction.response.send_modal(AnnouncementModal(channel))
+
+
+@bot.tree.command(name="schedule", description="Schedule an announcement to post later")
+@app_commands.describe(channel="Where to post the announcement")
+@app_commands.guild_only()
+async def schedule(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to use this command. Ask an admin to add your role with `/manager-access`.",
+            ephemeral=True,
+        )
+        return
+    perms = channel.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages):
+        await interaction.response.send_message(
+            f"I can't post in {channel.mention} yet. Give me **View Channel** and **Send Messages** there first.",
+            ephemeral=True,
+        )
+        return
+    if pending_count(interaction.guild_id) >= MAX_SCHEDULED:
+        await interaction.response.send_message(
+            f"This server already has {MAX_SCHEDULED} scheduled announcements, which is the limit. "
+            f"Cancel one with `/scheduled` first.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_modal(ScheduleModal(channel))
+
+
+@bot.tree.command(name="scheduled", description="See or cancel scheduled announcements")
+@app_commands.guild_only()
+async def scheduled(interaction: discord.Interaction):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to use this command. Ask an admin to add your role with `/manager-access`.",
+            ephemeral=True,
+        )
+        return
+    content, view = render_scheduled(interaction.guild_id)
+    kwargs = {"content": content, "ephemeral": True}
+    if view is not None:
+        kwargs["view"] = view
+    await interaction.response.send_message(**kwargs)
 
 
 @bot.tree.command(
