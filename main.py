@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import json
@@ -17,7 +18,8 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# update 2 fix: corrected default from the non-existent "gemini-3.5-flash-lite"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 # which translators to try, in order (comma separated): openai, gemini
 TRANSLATOR_ORDER = [
     x.strip().lower()
@@ -29,6 +31,10 @@ COOLDOWN_SECONDS = float(os.environ.get("COOLDOWN_SECONDS", "5"))  # per user be
 MAX_SCHEDULED = int(os.environ.get("MAX_SCHEDULED", "10"))        # pending scheduled announcements per server
 MISSED_GRACE_MINUTES = int(os.environ.get("MISSED_GRACE_MINUTES", "60"))  # how late a scheduled post may still go out
 MAX_TRANSLATE_CHARS = 4000                                        # longest text we translate on request
+MAX_IMAGE_BYTES = 8_000_000                                       # 8 MB image size limit for /send
+MAX_LINK_BUTTONS = 3                                              # max link buttons per announcement
+MAX_EXTRA_CHANNELS = 4                                            # extra channels beyond primary (total 5)
+MAX_TEMPLATES = 25                                                # saved templates per server
 DB_PATH = "bot.db"
 
 # (code, native name, flag), 25 languages = the max for one dropdown
@@ -118,15 +124,32 @@ def run_db(sql, params=()):
         con.close()
 
 
+def run_db_rowcount(sql, params=()):
+    """Like run_db but returns (rows, rowcount) so callers can check whether an UPDATE matched."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        cur = con.execute(sql, params)
+        con.commit()
+        return cur.fetchall(), cur.rowcount
+    finally:
+        con.close()
+
+
 def init_db():
     run_db(
         "CREATE TABLE IF NOT EXISTS announcements ("
         "message_id INTEGER PRIMARY KEY, text TEXT NOT NULL, languages TEXT NOT NULL)"
     )
     # update 1: remember the original language of each announcement
-    cols = [r[1] for r in run_db("PRAGMA table_info(announcements)")]
-    if "source_lang" not in cols:
+    ann_cols = [r[1] for r in run_db("PRAGMA table_info(announcements)")]
+    if "source_lang" not in ann_cols:
         run_db("ALTER TABLE announcements ADD COLUMN source_lang TEXT")
+    # update 3: link buttons and ping role per announcement
+    if "link_buttons" not in ann_cols:
+        run_db("ALTER TABLE announcements ADD COLUMN link_buttons TEXT")
+    if "ping_role_id" not in ann_cols:
+        run_db("ALTER TABLE announcements ADD COLUMN ping_role_id INTEGER")
+
     run_db(
         "CREATE TABLE IF NOT EXISTS translations ("
         "message_id INTEGER NOT NULL, lang TEXT NOT NULL, translation TEXT NOT NULL, "
@@ -163,11 +186,34 @@ def init_db():
         "languages TEXT NOT NULL, post_at INTEGER NOT NULL, "
         "status TEXT NOT NULL DEFAULT 'pending', note TEXT)"
     )
-    # a post that was in progress when the bot restarted may or may not have gone out
+    # update 2 fix: index for the scheduler's hot query
+    run_db(
+        "CREATE INDEX IF NOT EXISTS idx_scheduled_status_post_at "
+        "ON scheduled (status, post_at)"
+    )
+    # update 3: extra columns on scheduled
+    sched_cols = [r[1] for r in run_db("PRAGMA table_info(scheduled)")]
+    if "extra_channels" not in sched_cols:
+        run_db("ALTER TABLE scheduled ADD COLUMN extra_channels TEXT")
+    if "ping_role_id" not in sched_cols:
+        run_db("ALTER TABLE scheduled ADD COLUMN ping_role_id INTEGER")
+    if "link_buttons" not in sched_cols:
+        run_db("ALTER TABLE scheduled ADD COLUMN link_buttons TEXT")
+
+    # Recover rows that were mid-flight when the bot was restarted
+    # (they may or may not have been posted — flag them and log after ready)
     run_db(
         "UPDATE scheduled SET status = 'failed', "
         "note = 'Interrupted by a restart. Please check the channel.' "
         "WHERE status = 'posting'"
+    )
+
+    # update 3: saved templates
+    run_db(
+        "CREATE TABLE IF NOT EXISTS templates ("
+        "guild_id INTEGER NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, "
+        "languages TEXT NOT NULL, link_buttons TEXT, ping_role_id INTEGER, "
+        "PRIMARY KEY (guild_id, name))"
     )
 
 
@@ -519,7 +565,30 @@ async def reply_with_translation(interaction: discord.Interaction, text, code, s
         await interaction.followup.send(part, ephemeral=True)
 
 
-# ---------- the dropdown under each announcement ----------
+# ---------- link buttons helpers ----------
+def parse_link_buttons(raw_json):
+    """Returns a list of {"label": str, "url": str} dicts, or [] on any error."""
+    if not raw_json:
+        return []
+    try:
+        data = json.loads(raw_json)
+        if not isinstance(data, list):
+            return []
+        result = []
+        for item in data:
+            if isinstance(item, dict) and item.get("label") and item.get("url"):
+                result.append({"label": str(item["label"])[:80], "url": str(item["url"])})
+        return result[:MAX_LINK_BUTTONS]
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def validate_url(url: str) -> bool:
+    """Returns True if the URL looks like a valid http/https URL."""
+    return bool(re.match(r"^https?://\S+$", url.strip()))
+
+
+# ---------- the dropdown under each announcement (constraint 9: rebuilt on every click) ----------
 class LanguageSelect(discord.ui.Select):
     def __init__(self, codes=None):
         codes = codes or ALL_CODES
@@ -538,7 +607,7 @@ class LanguageSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         code = self.values[0]
         rows = run_db(
-            "SELECT text, languages, source_lang FROM announcements WHERE message_id = ?",
+            "SELECT text, languages, source_lang, link_buttons FROM announcements WHERE message_id = ?",
             (interaction.message.id,),
         )
         if not rows:
@@ -546,9 +615,13 @@ class LanguageSelect(discord.ui.Select):
                 "Sorry, I can't find this announcement anymore.", ephemeral=True
             )
             return
-        text, langs_json, source_lang = rows[0]
-        # reset the dropdown so the same language can be picked again
-        await interaction.response.edit_message(view=TranslateView(json.loads(langs_json)))
+        text, langs_json, source_lang, link_buttons_json = rows[0]
+        link_buttons = parse_link_buttons(link_buttons_json)
+        # Reset the dropdown so the same language can be picked again (constraint 9).
+        # Also rebuild link buttons so they survive the edit.
+        await interaction.response.edit_message(
+            view=TranslateView(json.loads(langs_json), link_buttons)
+        )
 
         if on_cooldown(interaction.user.id):
             await interaction.followup.send(
@@ -577,27 +650,58 @@ class LanguageSelect(discord.ui.Select):
 
 
 class TranslateView(discord.ui.View):
-    def __init__(self, codes=None):
+    """Persistent view on every announcement. Rebuilt on every dropdown click (constraint 9)."""
+    def __init__(self, codes=None, link_buttons=None):
         super().__init__(timeout=None)
         self.add_item(LanguageSelect(codes))
+        for btn in (link_buttons or [])[:MAX_LINK_BUTTONS]:
+            self.add_item(discord.ui.Button(
+                style=discord.ButtonStyle.link,
+                label=btn["label"][:80],
+                url=btn["url"],
+            ))
 
 
 # ---------- posting an announcement (used by /send and by the scheduler) ----------
-async def publish_announcement(channel, text, offered):
-    """Detects the language, posts the announcement with its dropdown and saves it.
+async def publish_announcement(
+    channel, text, offered,
+    ping_role_id=None, link_buttons=None, image_bytes=None, image_name=None,
+):
+    """Detects the language, posts the announcement and saves it.
 
-    Returns (message, codes_offered, source_language). May raise discord.Forbidden / HTTPException.
+    Returns (message, codes_offered, source_language).
+    May raise discord.Forbidden / HTTPException.
     """
     offered = offered or ALL_CODES
     source = await detect_language(text)
     codes = [c for c in offered if c != source]
     if not codes:          # never leave the dropdown empty
         codes = offered
-    msg = await channel.send(content=text, view=TranslateView(codes))
+
+    link_buttons = link_buttons or []
+    view = TranslateView(codes, link_buttons)
+
+    # Build content; ping mention goes at the top so it notifies before the text
+    content = text
+    allowed = discord.AllowedMentions.none()
+    if ping_role_id:
+        content = f"<@&{ping_role_id}>\n{text}"
+        allowed = discord.AllowedMentions(roles=True)
+
+    send_kwargs = {"content": content, "view": view, "allowed_mentions": allowed}
+    if image_bytes and image_name:
+        send_kwargs["file"] = discord.File(fp=io.BytesIO(image_bytes), filename=image_name)
+
+    msg = await channel.send(**send_kwargs)
     run_db(
-        "INSERT OR REPLACE INTO announcements (message_id, text, languages, source_lang) "
-        "VALUES (?, ?, ?, ?)",
-        (msg.id, text, json.dumps(codes), source),
+        "INSERT OR REPLACE INTO announcements "
+        "(message_id, text, languages, source_lang, link_buttons, ping_role_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            msg.id, text, json.dumps(codes), source,
+            json.dumps(link_buttons) if link_buttons else None,
+            ping_role_id,
+        ),
     )
     return msg, codes, source
 
@@ -608,7 +712,53 @@ def original_language_line(source):
     return ""
 
 
-# ---------- /send: modal -> language picker -> post ----------
+# ---------- link buttons modal (shared by /send and /schedule flows) ----------
+class LinkButtonsModal(discord.ui.Modal, title="Add link buttons (max 3)"):
+    b1_label = discord.ui.TextInput(label="Button 1 label", required=False, max_length=80, placeholder="e.g. Visit our site")
+    b1_url   = discord.ui.TextInput(label="Button 1 URL",   required=False, max_length=512, placeholder="https://…")
+    b2_label = discord.ui.TextInput(label="Button 2 label", required=False, max_length=80)
+    b2_url   = discord.ui.TextInput(label="Button 2 URL",   required=False, max_length=512)
+    b3_label = discord.ui.TextInput(label="Button 3 label", required=False, max_length=80)
+    b3_url   = discord.ui.TextInput(label="Button 3 URL",   required=False, max_length=512)
+
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        pairs = [
+            (self.b1_label.value.strip(), self.b1_url.value.strip()),
+            (self.b2_label.value.strip(), self.b2_url.value.strip()),
+            (self.b3_label.value.strip(), self.b3_url.value.strip()),
+        ]
+        buttons = []
+        errors = []
+        for label, url in pairs:
+            if not label and not url:
+                continue
+            if label and not url:
+                errors.append(f"Button "{label}" has a label but no URL.")
+            elif url and not label:
+                errors.append(f"The URL `{url[:40]}` has no label.")
+            elif not validate_url(url):
+                errors.append(f"`{url[:60]}` doesn't look like a valid https:// URL.")
+            else:
+                buttons.append({"label": label, "url": url})
+        if errors:
+            await interaction.response.send_message(
+                "⚠️ Fix these problems and try again:\n" + "\n".join(f"• {e}" for e in errors),
+                ephemeral=True,
+            )
+            return
+        self.parent_view.link_buttons = buttons[:MAX_LINK_BUTTONS]
+        btn_summary = ", ".join(f"**{b['label']}**" for b in buttons) if buttons else "none"
+        await interaction.response.edit_message(
+            content=self.parent_view.build_status_text() + f"\n🔗 Link buttons set: {btn_summary}",
+            view=self.parent_view,
+        )
+
+
+# ---------- /send: modal → options picker → preview → post ----------
 def language_select_options():
     return [
         discord.SelectOption(label=name, value=code, emoji=flag)
@@ -616,49 +766,184 @@ def language_select_options():
     ]
 
 
-class PickLanguagesView(discord.ui.View):
-    def __init__(self, channel, text):
+class PickOptionsView(discord.ui.View):
+    """Step 2 of /send: pick languages, extra channels, optional role and link buttons."""
+
+    def __init__(self, primary_channel, text, image_proxy_url=None, image_name=None):
         super().__init__(timeout=300)
-        self.channel = channel
+        self.primary_channel = primary_channel
         self.text = text
-        self.chosen = []
+        self.image_proxy_url = image_proxy_url   # download at post time
+        self.image_name = image_name
+        self.chosen_langs = []        # list of lang codes (empty = all 25)
+        self.extra_channels = []      # list of PartialInteractionChannel / TextChannel objects
+        self.ping_role = None         # discord.Role or None
+        self.link_buttons = []        # list of {"label": str, "url": str}
+
+    def build_status_text(self):
+        channels = [self.primary_channel] + list(self.extra_channels)
+        ch_list = " ".join(c.mention for c in channels)
+        lang_note = f"{len(self.chosen_langs)} languages chosen" if self.chosen_langs else "all 25 languages"
+        ping_note = f"pings {self.ping_role.mention}" if self.ping_role else "no ping"
+        image_note = f" · 📎 {self.image_name}" if self.image_name else ""
+        return f"📢 {ch_list} · {lang_note} · {ping_note}{image_note}"
 
     @discord.ui.select(
-        placeholder="Languages to offer (leave empty = all 25)",
-        min_values=0,
-        max_values=25,
+        placeholder="🌐 Languages to offer (leave empty = all 25)",
+        min_values=0, max_values=25,
         options=language_select_options(),
+        row=0,
     )
-    async def pick(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.chosen = list(select.values)
+    async def pick_langs(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.chosen_langs = list(select.values)
         await interaction.response.defer()
 
-    @discord.ui.button(label="Post announcement", style=discord.ButtonStyle.success)
-    async def post(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # detecting the language takes a moment, so tell Discord we're working on it
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="➕ Also post in… (optional, up to 4 more channels)",
+        min_values=0, max_values=4,
+        row=1,
+    )
+    async def pick_extra_channels(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        self.extra_channels = [c for c in select.values if c.id != self.primary_channel.id][:MAX_EXTRA_CHANNELS]
         await interaction.response.defer()
-        try:
-            msg, codes, source = await publish_announcement(
-                self.channel, self.text, self.chosen or ALL_CODES
-            )
-        except discord.Forbidden:
-            await interaction.edit_original_response(
-                content="I can't post in that channel. Please check my permissions there.",
-                view=None,
-            )
-            return
-        await interaction.edit_original_response(
-            content=f"✅ Posted in {self.channel.mention}", view=None
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🔔 Ping a role… (optional, one specific role only)",
+        min_values=0, max_values=1,
+        row=2,
+    )
+    async def pick_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        if select.values:
+            role = select.values[0]
+            if role.is_default():
+                await interaction.response.send_message(
+                    "⚠️ You can't ping @everyone here. Pick a specific role instead.", ephemeral=True
+                )
+                self.ping_role = None
+                return
+            self.ping_role = role
+        else:
+            self.ping_role = None
+        await interaction.response.defer()
+
+    @discord.ui.button(label="🔗 Link buttons…", style=discord.ButtonStyle.secondary, row=3)
+    async def link_buttons_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LinkButtonsModal(self))
+
+    @discord.ui.button(label="Preview & Post →", style=discord.ButtonStyle.success, row=3)
+    async def do_preview(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Build the warning about role ping mentionability
+        ping_warn = ""
+        if self.ping_role:
+            bot_perms = self.primary_channel.permissions_for(interaction.guild.me)
+            if not self.ping_role.mentionable and not bot_perms.mention_everyone:
+                ping_warn = (
+                    f"\n\n⚠️ **Ping warning:** {self.ping_role.mention} is not set to mentionable "
+                    f"and I don't have Mention Everyone permission — the ping **will not notify anyone**. "
+                    f"Enable the role's mentionable toggle or grant me Mention Everyone first."
+                )
+        channels = [self.primary_channel] + list(self.extra_channels)
+        ch_list = " + ".join(c.mention for c in channels)
+        lang_count = len(self.chosen_langs) if self.chosen_langs else 25
+        ping_line = f"\n🔔 **Ping:** {self.ping_role.mention}" if self.ping_role else ""
+        image_line = f"\n📎 **Image:** {self.image_name}" if self.image_name else ""
+        btn_lines = (
+            "\n".join(f"  • [{b['label']}]({b['url']})" for b in self.link_buttons)
+            if self.link_buttons else "  None"
         )
-        await send_log(
-            interaction.guild,
-            "📢 Announcement posted",
-            f"**By:** {interaction.user.mention}\n"
-            f"**Channel:** {self.channel.mention}\n"
-            f"{original_language_line(source)}"
-            f"**Languages offered:** {len(codes)}\n"
-            f"**Message:** [Jump to announcement]({msg.jump_url})\n\n"
-            f"> {preview(self.text)}",
+        preview_msg = (
+            f"**📋 Preview — this is exactly what will be posted**\n"
+            f"**Channel(s):** {ch_list}\n"
+            f"**Languages offered:** {lang_count}{ping_line}{image_line}\n"
+            f"**Link buttons:**\n{btn_lines}"
+            f"{ping_warn}\n"
+            f"{'─' * 32}\n"
+            f"{self.text[:1500]}"
+            + ("…" if len(self.text) > 1500 else "")
+        )
+        await interaction.response.edit_message(content=preview_msg, view=PreviewSendView(self))
+
+
+class PreviewSendView(discord.ui.View):
+    """Step 3 of /send: confirm or go back."""
+
+    def __init__(self, opts: PickOptionsView):
+        super().__init__(timeout=300)
+        self.opts = opts
+
+    @discord.ui.button(label="✅ Post", style=discord.ButtonStyle.success)
+    async def post(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        o = self.opts
+        offered = o.chosen_langs or ALL_CODES
+        channels = [o.primary_channel] + list(o.extra_channels)
+        ping_role_id = o.ping_role.id if o.ping_role else None
+
+        # Download image once if present
+        image_bytes = None
+        if o.image_proxy_url and o.image_name:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(o.image_proxy_url) as resp:
+                        if resp.status == 200:
+                            image_bytes = await resp.read()
+            except Exception as e:
+                print(f"Image download failed: {e!r}")
+                await interaction.edit_original_response(
+                    content="⚠️ Could not download the image from Discord. Please try again.", view=None
+                )
+                return
+
+        posted = []
+        failed = []
+        for ch in channels:
+            try:
+                # Resolve the partial channel to a full TextChannel if needed
+                full_ch = interaction.guild.get_channel(ch.id) or ch
+                msg, codes, source = await publish_announcement(
+                    full_ch, o.text, offered,
+                    ping_role_id=ping_role_id,
+                    link_buttons=o.link_buttons,
+                    image_bytes=image_bytes,
+                    image_name=o.image_name,
+                )
+                posted.append((full_ch, msg, codes, source))
+            except discord.Forbidden:
+                failed.append(f"{ch.mention} (missing permission)")
+            except discord.HTTPException as e:
+                failed.append(f"{ch.mention} (Discord error {e.status})")
+            except Exception as e:
+                failed.append(f"{ch.mention} ({type(e).__name__})")
+
+        lines = []
+        if posted:
+            lines.append("✅ **Posted:**")
+            for ch, msg, codes, source in posted:
+                lines.append(f"• {ch.mention} → [Jump]({msg.jump_url})")
+                await send_log(
+                    interaction.guild,
+                    "📢 Announcement posted",
+                    f"**By:** {interaction.user.mention}\n"
+                    f"**Channel:** {ch.mention}\n"
+                    f"{original_language_line(source)}"
+                    f"**Languages offered:** {len(codes)}\n"
+                    + (f"**Ping:** <@&{ping_role_id}>\n" if ping_role_id else "")
+                    + (f"**Link buttons:** {len(o.link_buttons)}\n" if o.link_buttons else "")
+                    + f"**Message:** [Jump]({msg.jump_url})\n\n> {preview(o.text)}",
+                )
+        if failed:
+            lines.append("⚠️ **Failed:**")
+            lines.extend(f"• {f}" for f in failed)
+        await interaction.edit_original_response(content="\n".join(lines) or "Nothing to post.", view=None)
+
+    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Adjust your options, then press **Preview & Post**.",
+            view=self.opts,
         )
 
 
@@ -670,14 +955,16 @@ class AnnouncementModal(discord.ui.Modal, title="New announcement"):
         placeholder="Type your announcement here…",
     )
 
-    def __init__(self, channel):
+    def __init__(self, channel, image_proxy_url=None, image_name=None):
         super().__init__()
         self.channel = channel
+        self.image_proxy_url = image_proxy_url
+        self.image_name = image_name
 
     async def on_submit(self, interaction: discord.Interaction):
-        view = PickLanguagesView(self.channel, self.message.value)
+        view = PickOptionsView(self.channel, self.message.value, self.image_proxy_url, self.image_name)
         await interaction.response.send_message(
-            "Choose which languages to offer (leave empty for all), then press **Post announcement**.",
+            "Adjust options below, then press **Preview & Post**.",
             view=view,
             ephemeral=True,
         )
@@ -719,59 +1006,189 @@ def finish_scheduled(sid, status, note=None):
     run_db("UPDATE scheduled SET status = ?, note = ? WHERE id = ?", (status, note, sid))
 
 
-class ScheduleLanguagesView(discord.ui.View):
-    def __init__(self, channel, text, post_at):
+class SchedulePickView(discord.ui.View):
+    """Step 2 of /schedule: pick languages, extra channels, optional role and link buttons."""
+
+    def __init__(self, primary_channel, text, post_at):
         super().__init__(timeout=300)
-        self.channel = channel
+        self.primary_channel = primary_channel
         self.text = text
         self.post_at = post_at
-        self.chosen = []
+        self.chosen_langs = []
+        self.extra_channels = []
+        self.ping_role = None
+        self.link_buttons = []
+
+    def build_status_text(self):
+        channels = [self.primary_channel] + list(self.extra_channels)
+        ch_list = " ".join(c.mention for c in channels)
+        lang_note = f"{len(self.chosen_langs)} languages chosen" if self.chosen_langs else "all 25 languages"
+        ping_note = f"pings {self.ping_role.mention}" if self.ping_role else "no ping"
+        return (
+            f"📅 <t:{self.post_at}:F> (<t:{self.post_at}:R>)\n"
+            f"📢 {ch_list} · {lang_note} · {ping_note}"
+        )
 
     @discord.ui.select(
-        placeholder="Languages to offer (leave empty = all 25)",
-        min_values=0,
-        max_values=25,
+        placeholder="🌐 Languages to offer (leave empty = all 25)",
+        min_values=0, max_values=25,
         options=language_select_options(),
+        row=0,
     )
-    async def pick(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.chosen = list(select.values)
+    async def pick_langs(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.chosen_langs = list(select.values)
         await interaction.response.defer()
 
-    @discord.ui.button(label="Schedule announcement", style=discord.ButtonStyle.success, emoji="📅")
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="➕ Also post in… (optional, up to 4 more channels)",
+        min_values=0, max_values=4,
+        row=1,
+    )
+    async def pick_extra_channels(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        self.extra_channels = [c for c in select.values if c.id != self.primary_channel.id][:MAX_EXTRA_CHANNELS]
+        await interaction.response.defer()
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🔔 Ping a role… (optional, one specific role only)",
+        min_values=0, max_values=1,
+        row=2,
+    )
+    async def pick_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        if select.values:
+            role = select.values[0]
+            if role.is_default():
+                await interaction.response.send_message(
+                    "⚠️ You can't ping @everyone here. Pick a specific role instead.", ephemeral=True
+                )
+                self.ping_role = None
+                return
+            self.ping_role = role
+        else:
+            self.ping_role = None
+        await interaction.response.defer()
+
+    @discord.ui.button(label="🔗 Link buttons…", style=discord.ButtonStyle.secondary, row=3)
+    async def link_buttons_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LinkButtonsModal(self))
+
+    @discord.ui.button(label="Preview & Schedule →", style=discord.ButtonStyle.success, row=3)
+    async def do_preview(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Time check: use the same 60-second minimum as the modal (bug 6 fix)
+        if self.post_at < int(time.time()) + 60:
+            await interaction.response.edit_message(
+                content="⚠️ That time has passed (or is under 1 minute away). Please run `/schedule` again.",
+                view=None,
+            )
+            return
         if pending_count(interaction.guild_id) >= MAX_SCHEDULED:
             await interaction.response.edit_message(
-                content=f"This server already has {MAX_SCHEDULED} scheduled announcements, which is the limit. "
+                content=f"⚠️ This server already has {MAX_SCHEDULED} scheduled announcements. "
                         f"Cancel one with `/scheduled` first.",
                 view=None,
             )
             return
-        if self.post_at < int(time.time()) + 30:
-            await interaction.response.edit_message(
-                content="That time has already passed. Please run `/schedule` again.", view=None
-            )
-            return
-        run_db(
-            "INSERT INTO scheduled (guild_id, channel_id, created_by, text, languages, post_at, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-            (
-                interaction.guild_id, self.channel.id, interaction.user.id, self.text,
-                json.dumps(self.chosen), self.post_at,
-            ),
+        ping_warn = ""
+        if self.ping_role:
+            bot_perms = self.primary_channel.permissions_for(interaction.guild.me)
+            if not self.ping_role.mentionable and not bot_perms.mention_everyone:
+                ping_warn = (
+                    f"\n\n⚠️ **Ping warning:** {self.ping_role.mention} is not mentionable "
+                    f"and I don't have Mention Everyone — the ping **will not notify anyone** unless "
+                    f"you fix this before the post fires."
+                )
+        channels = [self.primary_channel] + list(self.extra_channels)
+        ch_list = " + ".join(c.mention for c in channels)
+        lang_count = len(self.chosen_langs) if self.chosen_langs else 25
+        ping_line = f"\n🔔 **Ping:** {self.ping_role.mention}" if self.ping_role else ""
+        btn_lines = (
+            "\n".join(f"  • [{b['label']}]({b['url']})" for b in self.link_buttons)
+            if self.link_buttons else "  None"
+        )
+        preview_msg = (
+            f"**📋 Preview — scheduled announcement**\n"
+            f"**Posts at:** <t:{self.post_at}:F> (<t:{self.post_at}:R>)\n"
+            f"**Channel(s):** {ch_list}\n"
+            f"**Languages offered:** {lang_count}{ping_line}\n"
+            f"**Link buttons:**\n{btn_lines}"
+            f"{ping_warn}\n"
+            f"{'─' * 32}\n"
+            f"{self.text[:1500]}"
+            + ("…" if len(self.text) > 1500 else "")
         )
         await interaction.response.edit_message(
-            content=f"✅ Scheduled for <t:{self.post_at}:F> (<t:{self.post_at}:R>) in {self.channel.mention}.\n"
-                    f"See or cancel it with `/scheduled`.",
+            content=preview_msg,
+            view=PreviewScheduleView(self),
+        )
+
+
+class PreviewScheduleView(discord.ui.View):
+    """Step 3 of /schedule: confirm or go back."""
+
+    def __init__(self, pick: SchedulePickView):
+        super().__init__(timeout=300)
+        self.pick = pick
+
+    @discord.ui.button(label="📅 Schedule", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = self.pick
+        # Re-check time and cap at confirm time (bug 6 fix for the 60-second minimum)
+        if p.post_at < int(time.time()) + 60:
+            await interaction.response.edit_message(
+                content="⚠️ That time has passed. Please run `/schedule` again.", view=None
+            )
+            return
+        if pending_count(interaction.guild_id) >= MAX_SCHEDULED:
+            await interaction.response.edit_message(
+                content=f"⚠️ This server already has {MAX_SCHEDULED} scheduled announcements. "
+                        f"Cancel one with `/scheduled` first.",
+                view=None,
+            )
+            return
+        channels = [p.primary_channel] + list(p.extra_channels)
+        extra_ids = [c.id for c in p.extra_channels]
+        ping_role_id = p.ping_role.id if p.ping_role else None
+        # Discord response first (bug 3 fix), then DB write
+        ch_list = " + ".join(c.mention for c in channels)
+        await interaction.response.edit_message(
+            content=(
+                f"✅ Scheduled for <t:{p.post_at}:F> (<t:{p.post_at}:R>) in {ch_list}.\n"
+                f"See or cancel it with `/scheduled`."
+            ),
             view=None,
+        )
+        run_db(
+            "INSERT INTO scheduled "
+            "(guild_id, channel_id, created_by, text, languages, post_at, status, "
+            "extra_channels, ping_role_id, link_buttons) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+            (
+                interaction.guild_id, p.primary_channel.id, interaction.user.id,
+                p.text, json.dumps(p.chosen_langs), p.post_at,
+                json.dumps(extra_ids) if extra_ids else None,
+                ping_role_id,
+                json.dumps(p.link_buttons) if p.link_buttons else None,
+            ),
         )
         await send_log(
             interaction.guild,
             "📅 Announcement scheduled",
             f"**By:** {interaction.user.mention}\n"
-            f"**Channel:** {self.channel.mention}\n"
-            f"**Posts at:** <t:{self.post_at}:F> (<t:{self.post_at}:R>)\n\n"
-            f"> {preview(self.text)}",
+            f"**Channel(s):** {ch_list}\n"
+            f"**Posts at:** <t:{p.post_at}:F> (<t:{p.post_at}:R>)\n"
+            + (f"**Ping:** <@&{ping_role_id}>\n" if ping_role_id else "")
+            + (f"**Link buttons:** {len(p.link_buttons)}\n" if p.link_buttons else "")
+            + f"\n> {preview(p.text)}",
             color=0x57F287,
+        )
+
+    @discord.ui.button(label="← Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=self.pick.build_status_text(),
+            view=self.pick,
         )
 
 
@@ -814,16 +1231,16 @@ class ScheduleModal(discord.ui.Modal, title="Schedule announcement"):
             return
         if pending_count(interaction.guild_id) >= MAX_SCHEDULED:
             await interaction.response.send_message(
-                f"⚠️ This server already has {MAX_SCHEDULED} scheduled announcements, which is the limit. "
+                f"⚠️ This server already has {MAX_SCHEDULED} scheduled announcements. "
                 f"Cancel one with `/scheduled` first.",
                 ephemeral=True,
             )
             return
-        view = ScheduleLanguagesView(self.channel, self.message.value, post_at)
+        view = SchedulePickView(self.channel, self.message.value, post_at)
         await interaction.response.send_message(
-            f"📅 This will post in {self.channel.mention} on <t:{post_at}:F> (<t:{post_at}:R>).\n"
-            f"Discord shows that time in **your** local time, so check that it's what you meant. "
-            f"Then choose languages (leave empty for all) and press **Schedule announcement**.",
+            f"📅 <t:{post_at}:F> (<t:{post_at}:R>) in {self.channel.mention}.\n"
+            f"Discord shows that time in **your** local time — check that it's right. "
+            f"Then set options below and press **Preview & Schedule**.",
             view=view,
             ephemeral=True,
         )
@@ -843,9 +1260,14 @@ def render_scheduled(guild_id):
     if not rows:
         return "📅 No scheduled announcements. Create one with `/schedule`.", None
     lines = [
-        f"**#{r[0]}** · <t:{r[4]}:f> · <#{r[1]}>\n> {preview(r[3], 80)}" for r in rows
+        f"**#{r[0]}** · <t:{r[4]}:f> · <#{r[1]}>\n> {preview(r[3], 60)}" for r in rows
     ]
-    content = "📅 **Scheduled announcements**\n\n" + "\n".join(lines) + "\n\nPick one below to see it or cancel it."
+    # Truncate to stay under Discord's 2000-char limit (bug 7 fix)
+    content = "📅 **Scheduled announcements**\n\n" + "\n".join(lines)
+    suffix = "\n\nPick one below to see it or cancel it."
+    if len(content) + len(suffix) > 1990:
+        content = content[:1990 - len(suffix) - 1] + "…"
+    content += suffix
     return content, ScheduledListView(rows)
 
 
@@ -867,7 +1289,7 @@ class ScheduledListView(discord.ui.View):
     async def on_pick(self, interaction: discord.Interaction):
         sid = int(interaction.data["values"][0])
         rows = run_db(
-            "SELECT channel_id, created_by, text, post_at, status FROM scheduled "
+            "SELECT channel_id, created_by, text, post_at, status, extra_channels FROM scheduled "
             "WHERE id = ? AND guild_id = ?",
             (sid, interaction.guild_id),
         )
@@ -877,12 +1299,15 @@ class ScheduledListView(discord.ui.View):
                 content="That announcement is no longer pending.\n\n" + content, view=view
             )
             return
-        channel_id, created_by, text, post_at, _status = rows[0]
+        channel_id, created_by, text, post_at, _status, extra_channels_json = rows[0]
+        extra_ids = json.loads(extra_channels_json) if extra_channels_json else []
+        all_channel_ids = [channel_id] + extra_ids
+        ch_list = " ".join(f"<#{cid}>" for cid in all_channel_ids)
         await interaction.response.edit_message(
             content=(
                 f"📅 **Scheduled announcement #{sid}**\n"
                 f"**When:** <t:{post_at}:F> (<t:{post_at}:R>)\n"
-                f"**Channel:** <#{channel_id}>\n"
+                f"**Channel(s):** {ch_list}\n"
                 f"**Created by:** <@{created_by}>\n\n"
                 f"{preview(text, 1500)}"
             ),
@@ -914,7 +1339,11 @@ class ScheduledDetailView(discord.ui.View):
                 content="That announcement is no longer pending.\n\n" + content, view=view
             )
             return
-        finish_scheduled(self.sid, "cancelled", f"Cancelled by {interaction.user.id}")
+        # bug 9 fix: include human-readable name in note
+        finish_scheduled(
+            self.sid, "cancelled",
+            f"Cancelled by {interaction.user} (id={interaction.user.id})",
+        )
         content, view = render_scheduled(interaction.guild_id)
         await interaction.response.edit_message(
             content=f"✅ Announcement #{self.sid} was cancelled.\n\n" + content, view=view
@@ -1117,6 +1546,82 @@ class LogChannelView(AdminOnlyView):
         )
 
 
+# ---------- templates ----------
+def get_template(guild_id, name):
+    rows = run_db(
+        "SELECT text, languages, link_buttons, ping_role_id FROM templates "
+        "WHERE guild_id = ? AND name = ?",
+        (guild_id, name),
+    )
+    return rows[0] if rows else None
+
+
+def list_templates(guild_id):
+    return run_db(
+        "SELECT name, text FROM templates WHERE guild_id = ? ORDER BY name",
+        (guild_id,),
+    )
+
+
+def count_templates(guild_id):
+    rows = run_db("SELECT COUNT(*) FROM templates WHERE guild_id = ?", (guild_id,))
+    return rows[0][0] if rows else 0
+
+
+def save_template(guild_id, name, text, languages_json, link_buttons_json=None, ping_role_id=None):
+    run_db(
+        "INSERT INTO templates (guild_id, name, text, languages, link_buttons, ping_role_id) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(guild_id, name) DO UPDATE SET "
+        "text=excluded.text, languages=excluded.languages, "
+        "link_buttons=excluded.link_buttons, ping_role_id=excluded.ping_role_id",
+        (guild_id, name, text, languages_json, link_buttons_json, ping_role_id),
+    )
+
+
+def delete_template(guild_id, name):
+    run_db("DELETE FROM templates WHERE guild_id = ? AND name = ?", (guild_id, name))
+
+
+class SaveTemplateModal(discord.ui.Modal, title="Save template"):
+    tpl_name = discord.ui.TextInput(
+        label="Template name", max_length=50, placeholder="e.g. weekly-update"
+    )
+    tpl_text = discord.ui.TextInput(
+        label="Announcement text",
+        style=discord.TextStyle.paragraph,
+        max_length=2000,
+        placeholder="Type the template text here…",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.tpl_name.value.strip()
+        if not name:
+            await interaction.response.send_message("⚠️ Template name can't be blank.", ephemeral=True)
+            return
+        # Overwriting an existing template is always allowed; only check cap for new ones
+        existing = get_template(interaction.guild_id, name)
+        if existing is None and count_templates(interaction.guild_id) >= MAX_TEMPLATES:
+            await interaction.response.send_message(
+                f"⚠️ This server already has {MAX_TEMPLATES} saved templates. "
+                f"Delete one with `/template delete` first.",
+                ephemeral=True,
+            )
+            return
+        save_template(interaction.guild_id, name, self.tpl_text.value, json.dumps([]))
+        action = "updated" if existing else "saved"
+        await interaction.response.send_message(
+            f"✅ Template **{name}** {action}. Use it with `/template use name:{name}`.",
+            ephemeral=True,
+        )
+        await send_log(
+            interaction.guild,
+            "📄 Template saved",
+            f"**Name:** {name}\n**By:** {interaction.user.mention}\n\n> {preview(self.tpl_text.value)}",
+            color=0x57F287,
+        )
+
+
 # ---------- the bot ----------
 class TranslateBot(discord.Client):
     def __init__(self):
@@ -1139,13 +1644,23 @@ async def scheduler_loop():
     try:
         now = int(time.time())
         due = run_db(
-            "SELECT id, guild_id, channel_id, created_by, text, languages, post_at FROM scheduled "
+            "SELECT id, guild_id, channel_id, created_by, text, languages, post_at, "
+            "extra_channels, ping_role_id, link_buttons FROM scheduled "
             "WHERE status = 'pending' AND post_at <= ? ORDER BY post_at LIMIT 20",
             (now,),
         )
-        for sid, guild_id, channel_id, created_by, text, langs_json, post_at in due:
-            # claim it first, so it can never be posted twice
-            run_db("UPDATE scheduled SET status = 'posting' WHERE id = ?", (sid,))
+        for row in due:
+            (sid, guild_id, channel_id, created_by, text, langs_json, post_at,
+             extra_channels_json, ping_role_id, link_buttons_json) = row
+
+            # Atomically claim the row; guard against double-instance scenarios (bug 2 fix)
+            _, rowcount = run_db_rowcount(
+                "UPDATE scheduled SET status = 'posting' WHERE id = ? AND status = 'pending'",
+                (sid,),
+            )
+            if rowcount == 0:
+                continue  # another process already claimed it
+
             guild = bot.get_guild(guild_id)
 
             if now - post_at > MISSED_GRACE_MINUTES * 60:
@@ -1153,58 +1668,98 @@ async def scheduler_loop():
                 await send_log(
                     guild,
                     "⚠️ Scheduled announcement missed",
-                    f"Announcement **#{sid}** was due <t:{post_at}:F> but the bot was offline for too long, "
-                    f"so it was **not** posted. Schedule it again if you still need it.\n\n> {preview(text)}",
-                    color=0xED4245,
-                )
-                continue
-
-            channel = guild.get_channel(channel_id) if guild else None
-            if channel is None:
-                finish_scheduled(sid, "failed", "Channel or server not found")
-                await send_log(
-                    guild,
-                    "⚠️ Scheduled announcement failed",
-                    f"Announcement **#{sid}** could not be posted, because the channel was not found.\n\n"
+                    f"Announcement **#{sid}** was due <t:{post_at}:F> but the bot was offline "
+                    f"for too long and was **not** posted. Schedule it again if still needed.\n\n"
                     f"> {preview(text)}",
                     color=0xED4245,
                 )
+                if guild is None:
+                    print(f"Scheduler: missed announcement #{sid} for unknown guild {guild_id}")
                 continue
 
-            try:
-                offered = json.loads(langs_json) or ALL_CODES
-                msg, codes, source = await publish_announcement(channel, text, offered)
-            except discord.Forbidden:
-                finish_scheduled(sid, "failed", "Missing permission in the channel")
-                await send_log(
-                    guild,
-                    "⚠️ Scheduled announcement failed",
-                    f"Announcement **#{sid}** could not be posted in {channel.mention}: "
-                    f"I'm missing permission to post there.\n\n> {preview(text)}",
-                    color=0xED4245,
-                )
-            except discord.HTTPException as e:
-                finish_scheduled(sid, "failed", f"Discord error {e.status}")
-                await send_log(
-                    guild,
-                    "⚠️ Scheduled announcement failed",
-                    f"Announcement **#{sid}** could not be posted in {channel.mention} "
-                    f"(Discord error {e.status}).\n\n> {preview(text)}",
-                    color=0xED4245,
-                )
-            else:
+            # bug 5 fix: distinguish guild-not-found from channel-not-found
+            if guild is None:
+                finish_scheduled(sid, "failed", "Bot is no longer in this server")
+                print(f"Scheduler: announcement #{sid} failed — bot not in guild {guild_id}")
+                continue
+
+            extra_ids = json.loads(extra_channels_json) if extra_channels_json else []
+            all_channel_ids = [channel_id] + extra_ids
+            link_buttons = parse_link_buttons(link_buttons_json)
+            offered = json.loads(langs_json) or ALL_CODES
+
+            all_ok = True
+            jump_urls = []
+            for cid in all_channel_ids:
+                channel = guild.get_channel(cid)
+                if channel is None:
+                    finish_scheduled(sid, "failed", f"Channel {cid} not found")
+                    await send_log(
+                        guild,
+                        "⚠️ Scheduled announcement failed",
+                        f"Announcement **#{sid}** could not be posted: <#{cid}> was not found.\n\n"
+                        f"> {preview(text)}",
+                        color=0xED4245,
+                    )
+                    all_ok = False
+                    break
+                try:
+                    msg, codes, source = await publish_announcement(
+                        channel, text, offered,
+                        ping_role_id=ping_role_id,
+                        link_buttons=link_buttons,
+                    )
+                    jump_urls.append((channel, msg, codes, source))
+                except discord.Forbidden:
+                    finish_scheduled(sid, "failed", f"Missing Send Messages in #{cid}")
+                    await send_log(
+                        guild,
+                        "⚠️ Scheduled announcement failed",
+                        f"Announcement **#{sid}** could not post in {channel.mention}: "
+                        f"missing Send Messages permission.\n\n> {preview(text)}",
+                        color=0xED4245,
+                    )
+                    all_ok = False
+                    break
+                except discord.HTTPException as e:
+                    finish_scheduled(sid, "failed", f"Discord error {e.status} in #{cid}")
+                    await send_log(
+                        guild,
+                        "⚠️ Scheduled announcement failed",
+                        f"Announcement **#{sid}** could not post in {channel.mention} "
+                        f"(Discord error {e.status}).\n\n> {preview(text)}",
+                        color=0xED4245,
+                    )
+                    all_ok = False
+                    break
+                except Exception as e:
+                    # bug 4 fix: catch unexpected errors so rows never stay stuck in 'posting'
+                    finish_scheduled(sid, "failed", f"{type(e).__name__}: {e}")
+                    await send_log(
+                        guild,
+                        "⚠️ Scheduled announcement failed",
+                        f"Announcement **#{sid}** failed with an unexpected error: `{type(e).__name__}`.\n\n"
+                        f"> {preview(text)}",
+                        color=0xED4245,
+                    )
+                    print(f"Scheduler: unexpected error posting #{sid}: {e!r}")
+                    all_ok = False
+                    break
+
+            if all_ok:
                 finish_scheduled(sid, "done")
-                await send_log(
-                    guild,
-                    "⏰ Scheduled announcement posted",
-                    f"**Scheduled by:** <@{created_by}>\n"
-                    f"**Channel:** {channel.mention}\n"
-                    f"{original_language_line(source)}"
-                    f"**Languages offered:** {len(codes)}\n"
-                    f"**Message:** [Jump to announcement]({msg.jump_url})\n\n"
-                    f"> {preview(text)}",
-                    color=0x57F287,
-                )
+                for channel, msg, codes, source in jump_urls:
+                    await send_log(
+                        guild,
+                        "⏰ Scheduled announcement posted",
+                        f"**Scheduled by:** <@{created_by}>\n"
+                        f"**Channel:** {channel.mention}\n"
+                        f"{original_language_line(source)}"
+                        f"**Languages offered:** {len(codes)}\n"
+                        + (f"**Ping:** <@&{ping_role_id}>\n" if ping_role_id else "")
+                        + f"**Message:** [Jump]({msg.jump_url})\n\n> {preview(text)}",
+                        color=0x57F287,
+                    )
     except Exception as e:
         print(f"Scheduler error: {e!r}")
 
@@ -1237,17 +1792,21 @@ async def help_command(interaction: discord.Interaction):
         "into your language, privately.\n"
         "• `/translate`: translate any text you type.\n\n"
         "**For admins and managers**\n"
-        "• `/send`: post an announcement with a translation menu "
-        "(administrators and manager roles)\n"
-        "• `/schedule`: post an announcement later, at a date and time you choose\n"
-        "• `/scheduled`: see or cancel scheduled announcements\n"
+        "• `/send [channel] [image?]`: post an announcement. After submitting the text, you can "
+        "pick languages, ping a specific role, add up to 4 extra channels, add up to 3 link buttons, "
+        "then preview before posting.\n"
+        "• `/schedule [channel]`: same options as `/send` but posts at a date and time you choose.\n"
+        "• `/scheduled`: see or cancel scheduled announcements.\n"
+        "• `/template save`: save a reusable announcement template.\n"
+        "• `/template list`: see all saved templates.\n"
+        "• `/template use [name] [channel]`: start `/send` pre-filled from a saved template.\n"
+        "• `/template delete [name]`: remove a saved template.\n"
         "• `/manager-access`: choose which roles can use these commands, and set a private "
-        "log channel (administrators only)\n\n"
+        "log channel (administrators only).\n\n"
         "**Setup tips**\n"
-        "• The bot needs **View Channel**, **Send Messages** and **Embed Links** in the "
-        "channels it posts or logs in.\n"
-        f"• Each server gets **{DAILY_CAP}** new translations per day. Translations that "
-        "are already saved are free and don't count.",
+        "• The bot needs **View Channel**, **Send Messages** and **Embed Links** in channels it posts or logs in.\n"
+        "• For role pings to work, the role must be **mentionable**, or the bot needs **Mention Everyone**.\n"
+        f"• Each server gets **{DAILY_CAP}** new translations per day. Already-cached translations are free.",
         ephemeral=True,
     )
 
@@ -1353,32 +1912,63 @@ async def translate_command(
 
 
 @bot.tree.command(name="send", description="Post an announcement with a translation menu")
-@app_commands.describe(channel="Where to post the announcement")
+@app_commands.describe(
+    channel="Where to post the announcement",
+    image="Optional image to attach (jpg, png, gif, webp — max 8 MB)",
+)
 @app_commands.guild_only()
-async def send(interaction: discord.Interaction, channel: discord.TextChannel):
+async def send_command(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    image: Optional[discord.Attachment] = None,
+):
     if not can_send(interaction):
         await interaction.response.send_message(
-            "You don't have permission to use this command. Ask an admin to add your role with `/manager-access`.",
+            "You don't have permission to use this command. "
+            "Ask an admin to add your role with `/manager-access`.",
             ephemeral=True,
         )
         return
-    await interaction.response.send_modal(AnnouncementModal(channel))
+
+    image_proxy_url = None
+    image_name = None
+    if image is not None:
+        ct = (image.content_type or "").lower()
+        if not ct.startswith("image/"):
+            await interaction.response.send_message(
+                "⚠️ Only image files are allowed (jpg, png, gif, webp).", ephemeral=True
+            )
+            return
+        if image.size > MAX_IMAGE_BYTES:
+            await interaction.response.send_message(
+                f"⚠️ That image is too large (max {MAX_IMAGE_BYTES // 1_000_000} MB).", ephemeral=True
+            )
+            return
+        # Store the proxy URL; we download the bytes at post time (after the modal is dismissed)
+        image_proxy_url = image.proxy_url or image.url
+        image_name = image.filename
+
+    await interaction.response.send_modal(
+        AnnouncementModal(channel, image_proxy_url=image_proxy_url, image_name=image_name)
+    )
 
 
 @bot.tree.command(name="schedule", description="Schedule an announcement to post later")
 @app_commands.describe(channel="Where to post the announcement")
 @app_commands.guild_only()
-async def schedule(interaction: discord.Interaction, channel: discord.TextChannel):
+async def schedule_command(interaction: discord.Interaction, channel: discord.TextChannel):
     if not can_send(interaction):
         await interaction.response.send_message(
-            "You don't have permission to use this command. Ask an admin to add your role with `/manager-access`.",
+            "You don't have permission to use this command. "
+            "Ask an admin to add your role with `/manager-access`.",
             ephemeral=True,
         )
         return
     perms = channel.permissions_for(interaction.guild.me)
     if not (perms.view_channel and perms.send_messages):
         await interaction.response.send_message(
-            f"I can't post in {channel.mention} yet. Give me **View Channel** and **Send Messages** there first.",
+            f"I can't post in {channel.mention} yet. "
+            f"Give me **View Channel** and **Send Messages** there first.",
             ephemeral=True,
         )
         return
@@ -1394,10 +1984,11 @@ async def schedule(interaction: discord.Interaction, channel: discord.TextChanne
 
 @bot.tree.command(name="scheduled", description="See or cancel scheduled announcements")
 @app_commands.guild_only()
-async def scheduled(interaction: discord.Interaction):
+async def scheduled_command(interaction: discord.Interaction):
     if not can_send(interaction):
         await interaction.response.send_message(
-            "You don't have permission to use this command. Ask an admin to add your role with `/manager-access`.",
+            "You don't have permission to use this command. "
+            "Ask an admin to add your role with `/manager-access`.",
             ephemeral=True,
         )
         return
@@ -1419,5 +2010,105 @@ async def manager_access(interaction: discord.Interaction):
         panel_text(interaction.guild_id), view=ManagerPanelView(), ephemeral=True
     )
 
+
+# ---------- /template group ----------
+template_group = app_commands.Group(
+    name="template",
+    description="Saved announcement templates",
+    guild_only=True,
+)
+
+
+@template_group.command(name="save", description="Save a reusable announcement template")
+async def template_save(interaction: discord.Interaction):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to manage templates.", ephemeral=True
+        )
+        return
+    await interaction.response.send_modal(SaveTemplateModal())
+
+
+@template_group.command(name="list", description="List saved announcement templates")
+async def template_list(interaction: discord.Interaction):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to view templates.", ephemeral=True
+        )
+        return
+    rows = list_templates(interaction.guild_id)
+    if not rows:
+        await interaction.response.send_message(
+            "📄 No saved templates. Use `/template save` to create one.", ephemeral=True
+        )
+        return
+    lines = [f"• **{r[0]}** — {preview(r[1], 60)}" for r in rows]
+    await interaction.response.send_message(
+        f"📄 **Saved templates ({len(rows)}/{MAX_TEMPLATES})**\n\n" + "\n".join(lines)
+        + "\n\nUse `/template use name:…` to post one, or `/template delete name:…` to remove it.",
+        ephemeral=True,
+    )
+
+
+@template_group.command(name="use", description="Start a /send flow pre-filled from a saved template")
+@app_commands.describe(
+    name="Name of the template to use",
+    channel="Where to post the announcement",
+)
+async def template_use(
+    interaction: discord.Interaction,
+    name: str,
+    channel: discord.TextChannel,
+):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to use templates.", ephemeral=True
+        )
+        return
+    tpl = get_template(interaction.guild_id, name)
+    if tpl is None:
+        await interaction.response.send_message(
+            f"⚠️ No template named **{name}**. Use `/template list` to see all templates.",
+            ephemeral=True,
+        )
+        return
+    tpl_text, tpl_langs_json, tpl_link_buttons_json, _tpl_ping_role_id = tpl
+    view = PickOptionsView(channel, tpl_text)
+    view.chosen_langs = json.loads(tpl_langs_json) if tpl_langs_json else []
+    view.link_buttons = parse_link_buttons(tpl_link_buttons_json)
+    # ping_role_id from templates is kept as metadata but can't be restored to a live role
+    # object without a guild fetch; leave it None for the user to set again if needed
+    await interaction.response.send_message(
+        f"📄 **Template: {name}** loaded. Adjust options and press **Preview & Post**.",
+        view=view,
+        ephemeral=True,
+    )
+
+
+@template_group.command(name="delete", description="Delete a saved template")
+@app_commands.describe(name="Name of the template to delete")
+async def template_delete(interaction: discord.Interaction, name: str):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to manage templates.", ephemeral=True
+        )
+        return
+    tpl = get_template(interaction.guild_id, name)
+    if tpl is None:
+        await interaction.response.send_message(
+            f"⚠️ No template named **{name}**.", ephemeral=True
+        )
+        return
+    delete_template(interaction.guild_id, name)
+    await interaction.response.send_message(f"✅ Template **{name}** deleted.", ephemeral=True)
+    await send_log(
+        interaction.guild,
+        "🗑️ Template deleted",
+        f"**Name:** {name}\n**By:** {interaction.user.mention}",
+        color=0xFEE75C,
+    )
+
+
+bot.tree.add_command(template_group)
 
 bot.run(TOKEN)
