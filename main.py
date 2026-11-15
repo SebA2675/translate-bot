@@ -740,10 +740,11 @@ async def notify_cap(interaction: discord.Interaction):
     """Tells the person the daily limit is reached, and logs it once per day per server."""
     limits = get_server_limits(interaction.guild_id)
     cap = limits["daily_cap"]
-    await interaction.followup.send(
-        f"⚠️ This server reached its daily translation limit ({cap} new translations). Please try again tomorrow.",
-        ephemeral=True,
-    )
+    msg = f"⚠️ This server reached its daily translation limit ({cap} new translations). Please try again tomorrow."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
     key = (interaction.guild_id, today())
     if key not in _cap_logged:
         _cap_logged.add(key)
@@ -1282,10 +1283,11 @@ class ReportTranslationView(discord.ui.View):
                 ephemeral=True,
             )
         except Exception as e:
-            await interaction.response.send_message(
-                f"⚠️ Could not send report to the log channel ({e}). Please notify server staff.",
-                ephemeral=True,
-            )
+            err_msg = f"⚠️ Could not send report to the log channel ({e}). Please notify server staff."
+            if interaction.response.is_done():
+                await interaction.followup.send(err_msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(err_msg, ephemeral=True)
 
 
 async def reply_with_translation(interaction: discord.Interaction, text, code, style="natural"):
@@ -1359,6 +1361,8 @@ async def _explain_phrase_uncached(guild_id: int, p_hash: str, phrase: str, code
     )
     add_usage(guild_id)
     bump_language_usage(guild_id, code)
+    new_global = add_global_usage()
+    await check_owner_cap_alerts(new_global)
     return result
 
 
@@ -1381,6 +1385,7 @@ async def explain_phrase(guild_id: int, phrase: str, code: str):
     key = ("e", p_hash, code)
     task = _inflight.get(key)
     if task is None:
+        check_global_cap()
         if used_today(guild_id) >= get_server_limits(guild_id)["daily_cap"]:
             raise CapReached()
         task = asyncio.create_task(_explain_phrase_uncached(guild_id, p_hash, phrase, code))
@@ -1401,6 +1406,11 @@ async def reply_with_explanation(interaction: discord.Interaction, phrase: str, 
         explanation = await explain_phrase(interaction.guild_id, phrase, code)
     except CapReached:
         await notify_cap(interaction)
+        return
+    except GlobalCapReached:
+        await interaction.followup.send(
+            "The translator is very busy today, please try again tomorrow.", ephemeral=True
+        )
         return
 
     if explanation is None:
@@ -2814,6 +2824,11 @@ class RulesLanguageSelect(discord.ui.Select):
             )
         except CapReached:
             await notify_cap(interaction)
+            return
+        except GlobalCapReached:
+            await interaction.followup.send(
+                "The translator is very busy today, please try again tomorrow.", ephemeral=True
+            )
             return
 
         if not translated:
