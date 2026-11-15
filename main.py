@@ -38,6 +38,14 @@ MAX_EXTRA_CHANNELS = 4                                            # extra channe
 MAX_TEMPLATES = 25                                                # saved templates per server
 MAX_GLOSSARY = int(os.environ.get("MAX_GLOSSARY", "50"))          # Update 4: max glossary terms per server
 DB_PATH = "bot.db"
+# Mini updates env vars
+GLOBAL_DAILY_CAP = int(os.environ.get("GLOBAL_DAILY_CAP", "3000"))
+_owner_id_raw = os.environ.get("OWNER_ID", "797052378419167232").strip()
+OWNER_ID = int(_owner_id_raw) if _owner_id_raw.isdigit() else 797052378419167232
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "120"))
+SUPPORT_URL = os.environ.get("SUPPORT_URL", "https://discord.gg/75DnB64ufH").strip()
+PRIVACY_URL = os.environ.get("PRIVACY_URL", "").strip()
+TERMS_URL = os.environ.get("TERMS_URL", "").strip()
 # Update 9: Optional shared PostgreSQL database
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -256,6 +264,11 @@ def init_db():
         run_db("ALTER TABLE announcements ADD COLUMN link_buttons TEXT")
     if "ping_role_id" not in ann_cols:
         run_db("ALTER TABLE announcements ADD COLUMN ping_role_id INTEGER")
+    if "guild_id" not in ann_cols:
+        run_db("ALTER TABLE announcements ADD COLUMN guild_id INTEGER")
+    if "created_at" not in ann_cols:
+        run_db("ALTER TABLE announcements ADD COLUMN created_at INTEGER")
+        run_db("UPDATE announcements SET created_at = ? WHERE created_at IS NULL", (int(time.time()),))
 
     run_db(
         "CREATE TABLE IF NOT EXISTS translations ("
@@ -266,6 +279,11 @@ def init_db():
     trans_cols = get_table_columns("translations")
     if "glossary_hash" not in trans_cols:
         run_db("ALTER TABLE translations ADD COLUMN glossary_hash TEXT")
+    if "created_at" not in trans_cols:
+        run_db("ALTER TABLE translations ADD COLUMN created_at INTEGER")
+        run_db("UPDATE translations SET created_at = ? WHERE created_at IS NULL", (int(time.time()),))
+    if "manual" not in trans_cols:
+        run_db("ALTER TABLE translations ADD COLUMN manual INTEGER DEFAULT 0")
 
     run_db(
         "CREATE TABLE IF NOT EXISTS text_translations ("
@@ -394,11 +412,12 @@ def migrate_sqlite_to_postgres():
         return {"status": "error", "message": "PostgreSQL is not connected. Configure DATABASE_URL first."}
 
     tables = [
-        ("announcements", ["message_id", "text", "languages", "source_lang", "link_buttons", "ping_role_id"]),
-        ("translations", ["message_id", "lang", "translation", "glossary_hash"]),
-        ("text_translations", ["hash", "lang", "style", "translation"]),
+        ("announcements", ["message_id", "text", "languages", "source_lang", "link_buttons", "ping_role_id", "guild_id", "created_at"]),
+        ("translations", ["message_id", "lang", "translation", "glossary_hash", "created_at", "manual"]),
+        ("text_translations", ["hash", "lang", "style", "translation", "created_at"]),
         ("allowed_roles", ["guild_id", "role_id"]),
         ("usage", ["guild_id", "day", "count"]),
+        ("global_usage", ["day", "count"]),
         ("language_usage", ["guild_id", "lang", "count"]),
         ("settings", ["guild_id", "log_channel_id", "default_languages", "default_style"]),
         ("user_prefs", ["user_id", "lang"]),
@@ -556,6 +575,17 @@ class CapReached(Exception):
     pass
 
 
+class GlobalCapReached(Exception):
+    """Raised when the bot-wide GLOBAL_DAILY_CAP is reached."""
+    pass
+
+
+# Mini 1: Global usage & Owner alert tracking
+_owner_alert_80_day = None
+_owner_alert_100_day = None
+_last_owner_failure_alert_ts = 0
+_consecutive_translation_failures = 0
+
 _last_use = {}
 _cap_logged = set()
 _inflight = {}  # key -> running translation task
@@ -585,6 +615,74 @@ def add_usage(guild_id):
         "ON CONFLICT(guild_id, day) DO UPDATE SET count = count + 1",
         (guild_id, today()),
     )
+
+
+def global_used_today():
+    rows = run_db("SELECT count FROM global_usage WHERE day = ?", (today(),))
+    return rows[0][0] if rows else 0
+
+
+def check_global_cap():
+    if global_used_today() >= GLOBAL_DAILY_CAP:
+        raise GlobalCapReached()
+
+
+def add_global_usage() -> int:
+    run_db(
+        "INSERT INTO global_usage (day, count) VALUES (?, 1) "
+        "ON CONFLICT(day) DO UPDATE SET count = count + 1",
+        (today(),),
+    )
+    return global_used_today()
+
+
+async def send_owner_dm(text: str):
+    if not OWNER_ID:
+        print(f"[Owner Notification] {text}")
+        return
+    try:
+        user = bot.get_user(OWNER_ID)
+        if not user:
+            user = await bot.fetch_user(OWNER_ID)
+        if user:
+            await user.send(text)
+        else:
+            print(f"[Owner Notification] Could not fetch user {OWNER_ID}: {text}")
+    except Exception as e:
+        print(f"[Owner Notification DM Failed]: {text} (Error: {e})")
+
+
+async def check_owner_cap_alerts(new_global_count: int):
+    global _owner_alert_80_day, _owner_alert_100_day
+    day_str = today()
+
+    if new_global_count >= int(GLOBAL_DAILY_CAP * 0.8) and _owner_alert_80_day != day_str:
+        _owner_alert_80_day = day_str
+        await send_owner_dm(
+            f"⚠️ **Global Budget Alert:** Griedon Translator has reached **80%** of its global daily cap ({new_global_count}/{GLOBAL_DAILY_CAP}) today ({day_str} UTC)."
+        )
+
+    if new_global_count >= GLOBAL_DAILY_CAP and _owner_alert_100_day != day_str:
+        _owner_alert_100_day = day_str
+        await send_owner_dm(
+            f"🚨 **Global Budget Alert:** Griedon Translator has reached **100%** of its global daily cap ({new_global_count}/{GLOBAL_DAILY_CAP}) today ({day_str} UTC). New translations are paused until tomorrow."
+        )
+
+
+async def record_failure():
+    global _consecutive_translation_failures, _last_owner_failure_alert_ts
+    _consecutive_translation_failures += 1
+    now = time.time()
+    if _consecutive_translation_failures >= 5 and (now - _last_owner_failure_alert_ts) >= 3600:
+        _last_owner_failure_alert_ts = now
+        await send_owner_dm(
+            f"🚨 **API Outage Alert:** All configured translation engines have failed for **{_consecutive_translation_failures}** consecutive requests! Please check API keys and status."
+        )
+
+
+def record_success():
+    global _consecutive_translation_failures
+    _consecutive_translation_failures = 0
 
 
 # ---------- logs & settings helpers ----------
@@ -989,64 +1087,82 @@ async def detect_language(text):
 async def _translate_uncached(guild_id, message_id, text, code, g_hash):
     result = await _run_translators(text, code, guild_id=guild_id)
     if not result:
+        await record_failure()
         return None
+    record_success()
+    now_ts = int(time.time())
     run_db(
-        "INSERT INTO translations (message_id, lang, translation, glossary_hash) VALUES (?, ?, ?, ?) "
+        "INSERT INTO translations (message_id, lang, translation, glossary_hash, created_at, manual) VALUES (?, ?, ?, ?, ?, 0) "
         "ON CONFLICT(message_id, lang) DO UPDATE SET "
-        "translation = excluded.translation, glossary_hash = excluded.glossary_hash",
-        (message_id, code, result, g_hash),
+        "translation = excluded.translation, glossary_hash = excluded.glossary_hash, created_at = excluded.created_at, manual = 0",
+        (message_id, code, result, g_hash, now_ts),
     )
     add_usage(guild_id)
     bump_language_usage(guild_id, code)
+    new_global = add_global_usage()
+    await check_owner_cap_alerts(new_global)
     return result
 
 
 async def translate(guild_id, message_id, text, code):
-    """Returns the translation, or None on error. Raises CapReached if the daily cap is used up.
-
-    Saved translations are free. If many people ask for the same announcement + language
-    at the same moment, only ONE translation request is made and everyone shares the result.
-    The glossary hash is part of the cache validation so updated glossaries invalidate stale entries.
+    """Returns (translation, is_manual), or (None, False) on error.
+    Raises CapReached or GlobalCapReached if caps are exhausted.
     """
+    # 1. Check for manual/official translation first
+    manual_cached = run_db(
+        "SELECT translation FROM translations WHERE message_id = ? AND lang = ? AND manual = 1",
+        (message_id, code),
+    )
+    if manual_cached:
+        return manual_cached[0][0], True
+
+    # 2. Check cached AI translation
     g_hash = get_glossary_hash(guild_id)
     cached = run_db(
-        "SELECT translation, glossary_hash FROM translations WHERE message_id = ? AND lang = ?",
+        "SELECT translation, glossary_hash FROM translations WHERE message_id = ? AND lang = ? AND (manual = 0 OR manual IS NULL)",
         (message_id, code),
     )
     if cached:
         cached_trans, cached_hash = cached[0]
         if cached_hash == g_hash or (not g_hash and not cached_hash):
-            return cached_trans
+            return cached_trans, False
 
+    # 3. Not cached: check caps and translate
     key = ("a", message_id, code, g_hash)
     task = _inflight.get(key)
     if task is None:
         if used_today(guild_id) >= get_server_limits(guild_id)["daily_cap"]:
             raise CapReached()
+        check_global_cap()
         task = asyncio.create_task(_translate_uncached(guild_id, message_id, text, code, g_hash))
         _inflight[key] = task
         task.add_done_callback(lambda _t, k=key: _inflight.pop(k, None))
-    return await asyncio.shield(task)
+    res = await asyncio.shield(task)
+    return res, False
 
 
 # --- any text (commands / right-click): cached by the text itself + glossary hash ---
 async def _translate_text_uncached(guild_id, text_hash, text, code, style):
     result = await _run_translators(text, code, style, guild_id=guild_id)
     if not result:
+        await record_failure()
         return None
+    record_success()
+    now_ts = int(time.time())
     run_db(
-        "INSERT INTO text_translations (hash, lang, style, translation) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(hash, lang, style) DO UPDATE SET translation = excluded.translation",
-        (text_hash, code, style, result),
+        "INSERT INTO text_translations (hash, lang, style, translation, created_at) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(hash, lang, style) DO UPDATE SET translation = excluded.translation, created_at = excluded.created_at",
+        (text_hash, code, style, result, now_ts),
     )
     add_usage(guild_id)
     bump_language_usage(guild_id, code)
+    new_global = add_global_usage()
+    await check_owner_cap_alerts(new_global)
     return result
 
 
 async def translate_text(guild_id, text, code, style="natural"):
     g_hash = get_glossary_hash(guild_id)
-    # Update 4: The glossary is part of the cache key
     cache_payload = f"{text}|glossary:{g_hash}"
     text_hash = hashlib.sha256(cache_payload.encode("utf-8")).hexdigest()
 
@@ -1062,10 +1178,92 @@ async def translate_text(guild_id, text, code, style="natural"):
     if task is None:
         if used_today(guild_id) >= get_server_limits(guild_id)["daily_cap"]:
             raise CapReached()
+        check_global_cap()
         task = asyncio.create_task(_translate_text_uncached(guild_id, text_hash, text, code, style))
         _inflight[key] = task
         task.add_done_callback(lambda _t, k=key: _inflight.pop(k, None))
     return await asyncio.shield(task)
+
+
+_reported_translations = set()
+_user_last_report_ts = {}
+
+
+class ReportTranslationView(discord.ui.View):
+    def __init__(self, original_text, translated_text, lang_code, announcement_message_id=None, guild_id=None, channel_id=None):
+        super().__init__(timeout=600)
+        self.original_text = original_text
+        self.translated_text = translated_text
+        self.lang_code = lang_code
+        self.announcement_message_id = announcement_message_id
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+
+    @discord.ui.button(label="Report translation", emoji="🚩", style=discord.ButtonStyle.secondary)
+    async def report_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        now = time.time()
+        last_rep = _user_last_report_ts.get(interaction.user.id, 0)
+        if now - last_rep < 15:
+            await interaction.response.send_message(
+                "⏳ Please wait a moment before submitting another report.", ephemeral=True
+            )
+            return
+
+        report_ident = str(self.announcement_message_id) if self.announcement_message_id else hashlib.sha256(self.original_text.encode("utf-8")).hexdigest()[:16]
+        report_key = (interaction.user.id, self.lang_code, report_ident)
+
+        if report_key in _reported_translations:
+            await interaction.response.send_message(
+                "You have already reported this translation.", ephemeral=True
+            )
+            return
+
+        log_channel_id = get_log_channel_id(interaction.guild_id) if interaction.guild_id else None
+        log_channel = interaction.guild.get_channel(log_channel_id) if (interaction.guild and log_channel_id) else None
+
+        if not log_channel:
+            await interaction.response.send_message(
+                "No staff log channel is configured for this server. Please contact server moderators directly.",
+                ephemeral=True,
+            )
+            return
+
+        _reported_translations.add(report_key)
+        _user_last_report_ts[interaction.user.id] = now
+
+        name, flag = LANG_BY_CODE.get(self.lang_code, (self.lang_code, "🌐"))
+        orig_prev = preview(self.original_text, 200)
+        trans_prev = preview(self.translated_text, 200)
+
+        embed = discord.Embed(
+            title="🚩 Translation Reported",
+            color=0xED4245,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Language", value=f"{flag} {name} (`{self.lang_code}`)", inline=True)
+        embed.add_field(name="Reported By", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=True)
+
+        if self.announcement_message_id and self.guild_id and self.channel_id:
+            msg_link = f"https://discord.com/channels/{self.guild_id}/{self.channel_id}/{self.announcement_message_id}"
+            embed.add_field(name="Announcement", value=f"[Jump to Message]({msg_link})", inline=False)
+
+        embed.add_field(name="Original Text (Preview)", value=f"```{orig_prev}```", inline=False)
+        embed.add_field(name="Translation (Preview)", value=f"```{trans_prev}```", inline=False)
+
+        try:
+            await log_channel.send(embed=embed)
+            button.disabled = True
+            button.label = "Reported"
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send(
+                "✅ Thank you! This translation has been reported to the server moderators.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"⚠️ Could not send report to the log channel ({e}). Please notify server staff.",
+                ephemeral=True,
+            )
 
 
 async def reply_with_translation(interaction: discord.Interaction, text, code, style="natural"):
@@ -1080,6 +1278,12 @@ async def reply_with_translation(interaction: discord.Interaction, text, code, s
     except CapReached:
         await notify_cap(interaction)
         return
+    except GlobalCapReached:
+        await interaction.followup.send(
+            "The translator is very busy today, please try again tomorrow.", ephemeral=True
+        )
+        return
+
     if translated is None:
         await interaction.followup.send(
             "⚠️ Translation is unavailable right now. Please try again in a moment.",
@@ -1087,8 +1291,20 @@ async def reply_with_translation(interaction: discord.Interaction, text, code, s
         )
         return
     name, flag = LANG_BY_CODE[code]
-    for part in split_text(f"{flag} **{name}**\n\n{translated}"):
-        await interaction.followup.send(part, ephemeral=True)
+    parts = split_text(f"{flag} **{name}**\n\n{translated}")
+    rep_view = ReportTranslationView(
+        original_text=text,
+        translated_text=translated,
+        lang_code=code,
+        announcement_message_id=None,
+        guild_id=interaction.guild_id,
+        channel_id=interaction.channel_id,
+    )
+    for i, part in enumerate(parts):
+        if i == len(parts) - 1:
+            await interaction.followup.send(part, view=rep_view, ephemeral=True)
+        else:
+            await interaction.followup.send(part, ephemeral=True)
 
 
 # ---------- slang / phrase explanations (Update 7) ----------
@@ -1201,7 +1417,63 @@ def validate_url(url: str) -> bool:
     return bool(re.match(r"^https?://\S+$", url.strip()))
 
 
-# ---------- the dropdown under each announcement (constraint 9: rebuilt on every click) ----------
+# ---------- announcement translation delivery (shared by dropdown and one-click button) ----------
+async def deliver_announcement_translation(
+    interaction: discord.Interaction,
+    message_id: int,
+    text: str,
+    code: str,
+    source_lang: Optional[str] = None,
+):
+    if on_cooldown(interaction.user.id):
+        await interaction.followup.send(
+            "⏳ Please wait a few seconds before translating again.", ephemeral=True
+        )
+        return
+
+    try:
+        translated, is_manual = await translate(interaction.guild_id, message_id, text, code)
+    except CapReached:
+        await notify_cap(interaction)
+        return
+    except GlobalCapReached:
+        await interaction.followup.send(
+            "The translator is very busy today, please try again tomorrow.", ephemeral=True
+        )
+        return
+
+    if translated is None:
+        await interaction.followup.send(
+            "⚠️ Translation is unavailable right now. Please try again in a moment.",
+            ephemeral=True,
+        )
+        return
+
+    name, flag = LANG_BY_CODE[code]
+    if is_manual:
+        header = f"📌 **Official translation** ({flag} {name})"
+    else:
+        header = f"{flag} **{name}**"
+        if source_lang in LANG_BY_CODE:
+            header += f" · translated from {LANG_BY_CODE[source_lang][0]}"
+
+    parts = split_text(f"{header}\n\n{translated}")
+    report_view = ReportTranslationView(
+        original_text=text,
+        translated_text=translated,
+        lang_code=code,
+        announcement_message_id=message_id,
+        guild_id=interaction.guild_id,
+        channel_id=interaction.channel_id,
+    )
+    for i, part in enumerate(parts):
+        if i == len(parts) - 1:
+            await interaction.followup.send(part, view=report_view, ephemeral=True)
+        else:
+            await interaction.followup.send(part, ephemeral=True)
+
+
+# ---------- the dropdown and one-click button under each announcement (constraint 9) ----------
 class LanguageSelect(discord.ui.Select):
     def __init__(self, codes=None):
         codes = codes or ALL_CODES
@@ -1231,35 +1503,60 @@ class LanguageSelect(discord.ui.Select):
         text, langs_json, source_lang, link_buttons_json = rows[0]
         link_buttons = parse_link_buttons(link_buttons_json)
         # Reset the dropdown so the same language can be picked again (constraint 9).
-        # Also rebuild link buttons so they survive the edit.
         await interaction.response.edit_message(
             view=TranslateView(json.loads(langs_json), link_buttons)
         )
+        await deliver_announcement_translation(interaction, interaction.message.id, text, code, source_lang)
 
-        if on_cooldown(interaction.user.id):
-            await interaction.followup.send(
-                "⏳ Please wait a few seconds before translating again.", ephemeral=True
-            )
-            return
 
-        try:
-            translated = await translate(interaction.guild_id, interaction.message.id, text, code)
-        except CapReached:
-            await notify_cap(interaction)
-            return
+class TranslateToMyLangButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            custom_id="tr:mylang_btn",
+            style=discord.ButtonStyle.secondary,
+            label="Translate to my language",
+            emoji="🌐",
+        )
 
-        if translated is None:
-            await interaction.followup.send(
-                "⚠️ Translation is unavailable right now. Please try again in a moment.",
+    async def callback(self, interaction: discord.Interaction):
+        user_code = resolve_user_lang(interaction)
+        if not user_code or user_code not in ALL_CODES:
+            await interaction.response.send_message(
+                "We don't know your language yet! Set it once with `/mylanguage` or pick your language from the dropdown.",
                 ephemeral=True,
             )
             return
-        name, flag = LANG_BY_CODE[code]
-        header = f"{flag} **{name}**"
-        if source_lang in LANG_BY_CODE:
-            header += f" · translated from {LANG_BY_CODE[source_lang][0]}"
-        for part in split_text(f"{header}\n\n{translated}"):
-            await interaction.followup.send(part, ephemeral=True)
+
+        rows = run_db(
+            "SELECT text, languages, source_lang, link_buttons FROM announcements WHERE message_id = ?",
+            (interaction.message.id,),
+        )
+        if not rows:
+            await interaction.response.send_message(
+                "Sorry, I can't find this announcement anymore.", ephemeral=True
+            )
+            return
+
+        text, langs_json, source_lang, link_buttons_json = rows[0]
+        offered = json.loads(langs_json)
+
+        if source_lang == user_code:
+            lang_name = LANG_BY_CODE.get(user_code, (user_code, ""))[0]
+            await interaction.response.send_message(
+                f"This announcement is already in your language ({lang_name}).", ephemeral=True
+            )
+            return
+
+        if user_code not in offered:
+            lang_name = LANG_BY_CODE.get(user_code, (user_code, ""))[0]
+            await interaction.response.send_message(
+                f"Your language ({lang_name}) is not offered on this announcement. Please pick an available language from the dropdown below.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await deliver_announcement_translation(interaction, interaction.message.id, text, user_code, source_lang)
 
 
 class TranslateView(discord.ui.View):
@@ -1267,6 +1564,7 @@ class TranslateView(discord.ui.View):
     def __init__(self, codes=None, link_buttons=None):
         super().__init__(timeout=None)
         self.add_item(LanguageSelect(codes))
+        self.add_item(TranslateToMyLangButton())
         for btn in (link_buttons or [])[:MAX_LINK_BUTTONS]:
             self.add_item(discord.ui.Button(
                 style=discord.ButtonStyle.link,
@@ -1306,17 +1604,20 @@ async def publish_announcement(
         send_kwargs["file"] = discord.File(fp=io.BytesIO(image_bytes), filename=image_name)
 
     msg = await channel.send(**send_kwargs)
+    now_ts = int(time.time())
+    guild_id = channel.guild.id if hasattr(channel, "guild") and channel.guild else None
     run_db(
         "INSERT INTO announcements "
-        "(message_id, text, languages, source_lang, link_buttons, ping_role_id) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
+        "(message_id, text, languages, source_lang, link_buttons, ping_role_id, guild_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(message_id) DO UPDATE SET "
         "text = excluded.text, languages = excluded.languages, source_lang = excluded.source_lang, "
-        "link_buttons = excluded.link_buttons, ping_role_id = excluded.ping_role_id",
+        "link_buttons = excluded.link_buttons, ping_role_id = excluded.ping_role_id, "
+        "guild_id = excluded.guild_id, created_at = excluded.created_at",
         (
             msg.id, text, json.dumps(codes), source,
             json.dumps(link_buttons) if link_buttons else None,
-            ping_role_id,
+            ping_role_id, guild_id, now_ts,
         ),
     )
     return msg, codes, source
@@ -2679,11 +2980,12 @@ class TranslateBot(discord.Client):
 
     async def setup_hook(self):
         init_db()
-        self.add_view(TranslateView())     # keeps old dropdowns working after restarts
+        self.add_view(TranslateView())     # keeps old dropdowns and one-click buttons working after restarts
         self.add_view(LanguageRoleView())  # Update 6: persistent language role panels
         self.add_view(RulesPanelView())    # Update 6: persistent rules panels
         await self.tree.sync()
         scheduler_loop.start()
+        cleanup_loop.start()
 
 
 bot = TranslateBot()
@@ -2817,10 +3119,128 @@ async def before_scheduler():
     await bot.wait_until_ready()
 
 
+# ---------- daily cleanup loop (Mini 2: data retention) ----------
+@tasks.loop(hours=24)
+async def cleanup_loop():
+    try:
+        now_ts = int(time.time())
+        retention_sec = RETENTION_DAYS * 86400
+        cutoff_ts = now_ts - retention_sec
+
+        # 1. Delete announcements and their translations older than RETENTION_DAYS
+        old_anns = run_db(
+            "SELECT message_id FROM announcements WHERE created_at IS NOT NULL AND created_at <= ?",
+            (cutoff_ts,),
+        )
+        if old_anns:
+            ann_ids = [r[0] for r in old_anns]
+            for start in range(0, len(ann_ids), 100):
+                chunk = ann_ids[start:start+100]
+                placeholders = ",".join(["?"] * len(chunk))
+                run_db(f"DELETE FROM translations WHERE message_id IN ({placeholders})", chunk)
+                run_db(f"DELETE FROM announcements WHERE message_id IN ({placeholders})", chunk)
+            print(f"[Cleanup] Deleted {len(ann_ids)} expired announcements and their translations.")
+
+        # 2. Delete expired text_translations older than RETENTION_DAYS
+        _, cnt_text = run_db_rowcount(
+            "DELETE FROM text_translations WHERE created_at IS NOT NULL AND created_at <= ?",
+            (cutoff_ts,),
+        )
+        if cnt_text > 0:
+            print(f"[Cleanup] Deleted {cnt_text} expired text translations.")
+
+        # 3. Finished scheduled announcements older than 30 days
+        sched_cutoff = now_ts - (30 * 86400)
+        _, cnt_sched = run_db_rowcount(
+            "DELETE FROM scheduled WHERE status != 'pending' AND post_at <= ?",
+            (sched_cutoff,),
+        )
+        if cnt_sched > 0:
+            print(f"[Cleanup] Deleted {cnt_sched} finished scheduled rows.")
+
+        # 4. Usage rows older than 400 days
+        cutoff_day = (datetime.now(timezone.utc) - timedelta(days=400)).strftime("%Y-%m-%d")
+        _, cnt_usage = run_db_rowcount("DELETE FROM usage WHERE day < ?", (cutoff_day,))
+        _, cnt_global = run_db_rowcount("DELETE FROM global_usage WHERE day < ?", (cutoff_day,))
+        if cnt_usage > 0 or cnt_global > 0:
+            print(f"[Cleanup] Deleted expired usage records ({cnt_usage} server, {cnt_global} global).")
+    except Exception as e:
+        print(f"[Cleanup] Error in data lifecycle loop: {e}")
+
+
+@cleanup_loop.before_loop
+async def before_cleanup_loop():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     print(f"Translator order: {TRANSLATOR_ORDER}")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    try:
+        support_line = f"\n• **Support Server:** {SUPPORT_URL}" if SUPPORT_URL else ""
+        welcome_text = (
+            f"👋 **Thanks for adding Griedon Translator to {guild.name}!**\n\n"
+            "Here is how to get started in 3 easy steps:\n"
+            "1. **`/manager-access`**: Authorize staff roles to manage announcements and translations.\n"
+            "2. **Log Channel**: Configure a private audit log channel in `/manager-access`.\n"
+            "3. **`/send`**: Post your first multi-language announcement with role pings, link buttons, and interactive previews!\n\n"
+            f"Type **`/help`** to explore all member and manager commands.{support_line}"
+        )
+
+        target_channel = guild.system_channel
+        if not target_channel or not target_channel.permissions_for(guild.me).send_messages:
+            target_channel = next(
+                (ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages),
+                None,
+            )
+
+        if target_channel:
+            await target_channel.send(welcome_text, allowed_mentions=discord.AllowedMentions.none())
+        elif guild.owner:
+            try:
+                await guild.owner.send(welcome_text)
+            except Exception:
+                pass
+        elif guild.owner_id:
+            try:
+                owner = bot.get_user(guild.owner_id) or await bot.fetch_user(guild.owner_id)
+                if owner:
+                    await owner.send(welcome_text)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Error sending welcome message for guild {guild.id}: {e}")
+
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    try:
+        guild_id = guild.id
+        print(f"Bot removed from guild: {guild.name} ({guild_id}). Cleaning up server data...")
+        run_db(
+            "DELETE FROM translations WHERE message_id IN ("
+            "SELECT message_id FROM announcements WHERE guild_id = ?)",
+            (guild_id,),
+        )
+        run_db("DELETE FROM announcements WHERE guild_id = ?", (guild_id,))
+        run_db("DELETE FROM allowed_roles WHERE guild_id = ?", (guild_id,))
+        run_db("DELETE FROM settings WHERE guild_id = ?", (guild_id,))
+        run_db("DELETE FROM usage WHERE guild_id = ?", (guild_id,))
+        run_db("DELETE FROM language_usage WHERE guild_id = ?", (guild_id,))
+        run_db("DELETE FROM scheduled WHERE guild_id = ?", (guild_id,))
+        run_db("DELETE FROM templates WHERE guild_id = ?", (guild_id,))
+        run_db("DELETE FROM glossary WHERE guild_id = ?", (guild_id,))
+        run_db("DELETE FROM language_roles WHERE guild_id = ?", (guild_id,))
+        run_db("DELETE FROM rules_panels WHERE guild_id = ?", (guild_id,))
+        run_db("DELETE FROM server_plans WHERE guild_id = ?", (guild_id,))
+        print(f"Cleanup for guild {guild_id} completed.")
+    except Exception as e:
+        print(f"Error during on_guild_remove for guild {guild.id}: {e}")
 
 
 @bot.tree.command(name="ping", description="Check if the bot is alive")
@@ -2833,29 +3253,31 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(
         "**🌐 Translator bot: help**\n\n"
         "**For members**\n"
-        "• Under an announcement or rules panel, open the 🌐 dropdown and pick your language. "
-        "The translation appears privately, only for you.\n"
+        "• Under an announcement, pick your language from the 🌐 dropdown or click **Translate to my language** to translate privately.\n"
+        "• Click **Report translation** (🚩) under any translation to alert server staff of errors.\n"
         "• Under a language roles panel, pick your language to receive its role.\n"
-        "• `/mylanguage`: save your language once.\n"
-        "• Right-click any message → **Apps** → **Translate message** to translate it "
-        "into your language, privately.\n"
+        "• `/mylanguage`: save your language once for automatic translations.\n"
+        "• Right-click any message → **Apps** → **Translate message** to translate it privately.\n"
         "• `/translate`: translate any text you type.\n"
         "• `/explain`: explain unfamiliar slang, idioms, acronyms, or phrases in your language.\n"
-        "• Right-click any message → **Apps** → **Explain slang/phrase** to explain slang in that message.\n\n"
+        "• Right-click any message → **Apps** → **Explain slang/phrase** to explain slang in that message.\n"
+        "• `/privacy`: view data retention, privacy policy, and AI processing details.\n\n"
         "**For admins and managers**\n"
-        "• `/send [channel] [image?]`: post an announcement with an interactive preview, optional role ping, link buttons, and multi-channel posting.\n"
-        "• `/schedule [channel]`: same options as `/send` but posts at a date and time you choose.\n"
-        "• `/scheduled`: see or cancel scheduled announcements.\n"
+        "• `/send [channel] [image?]`: post an announcement with preview, role ping, link buttons, and multi-channel posting.\n"
+        "• `/schedule [channel]`: schedule announcements with the same options as `/send`.\n"
+        "• Right-click any bot announcement → **Apps** → **Set official translation**: set human-reviewed translations with zero API cost.\n"
+        "• Right-click any bot announcement → **Apps** → **Edit announcement**: update announcement text and invalidate stale translations.\n"
+        "• Right-click any bot announcement → **Apps** → **Delete announcement**: delete announcement and cached translations.\n"
+        "• `/scheduled`: view or cancel scheduled announcements.\n"
         "• `/template save/list/use/delete`: manage announcement templates.\n"
         "• `/glossary add/list/remove/clear`: configure terms that stay untranslated or translate a fixed way.\n"
         "• `/settings`: configure server defaults (default announcement languages, translation tone).\n"
         "• `/stats`: view translation activity, daily usage breakdown, and top requested languages.\n"
         "• `/language-roles add/remove/list/post`: create a self-serve language role dropdown panel.\n"
         "• `/rules-panel post [channel]`: post a rules or welcome panel with multi-language dropdown translations.\n"
-        "• `/plan view`: view this server's plan and resource limits (Pro & Ultra tiers available).\n"
-        "• `/plan set/remove`: grant, update, or reset a server's plan tier (administrators only).\n"
+        "• `/plan view/set/remove`: manage server plan tier (Free, Pro, Ultra).\n"
         "• `/migrate-db`: migrate local SQLite data to PostgreSQL (administrators only).\n"
-        "• `/manager-access`: choose which roles can use these commands, and set a private log channel (administrators only).\n\n"
+        "• `/manager-access`: configure manager roles and set private audit log channel.\n\n"
         "**Setup tips**\n"
         "• The bot needs **View Channel**, **Send Messages** and **Embed Links** in channels it posts or logs in.\n"
         "• For language roles, the bot needs **Manage Roles** and its role must be **above** the language roles in Server Settings.\n"
@@ -3214,6 +3636,15 @@ async def stats_command(interaction: discord.Interaction):
         ),
         inline=False,
     )
+
+    if OWNER_ID and interaction.user.id == OWNER_ID:
+        g_cnt = global_used_today()
+        g_pct = (g_cnt / GLOBAL_DAILY_CAP) * 100 if GLOBAL_DAILY_CAP > 0 else 0
+        embed.add_field(
+            name="👑 Owner Global Usage",
+            value=f"**{g_cnt} / {GLOBAL_DAILY_CAP}** global translations today (`{g_pct:.1f}%`)",
+            inline=False,
+        )
     embed.set_footer(text="🔒 Privacy protected: Counts only. Message text is never stored or tracked.")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -3832,6 +4263,343 @@ async def plan_remove(interaction: discord.Interaction, server_id: Optional[str]
             color=0xED4245,
         )
 
+
+
+# ---------- Mini 6: Official (manual) translations by admins ----------
+class ChooseOfficialLangView(discord.ui.View):
+    def __init__(self, message_id: int, offered_codes: list):
+        super().__init__(timeout=180)
+        self.message_id = message_id
+        options = [
+            discord.SelectOption(label=LANG_BY_CODE[c][0], value=c, emoji=LANG_BY_CODE[c][1])
+            for c in offered_codes if c in LANG_BY_CODE
+        ]
+        select = discord.ui.Select(
+            placeholder="Select language to set official translation…",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+        )
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        lang_code = interaction.data["values"][0]
+        cached_manual = run_db(
+            "SELECT translation FROM translations WHERE message_id = ? AND lang = ? AND manual = 1",
+            (self.message_id, lang_code),
+        )
+        existing_val = cached_manual[0][0] if cached_manual else ""
+        modal = SetOfficialTranslationModal(self.message_id, lang_code, existing_val)
+        await interaction.response.send_modal(modal)
+
+
+class SetOfficialTranslationModal(discord.ui.Modal):
+    def __init__(self, message_id: int, lang_code: str, existing_translation: str = ""):
+        name, flag = LANG_BY_CODE.get(lang_code, (lang_code, "🌐"))
+        super().__init__(title=f"Official Translation: {name[:15]}")
+        self.message_id = message_id
+        self.lang_code = lang_code
+        self.translation_input = discord.ui.TextInput(
+            label="Translation (empty to remove)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=2000,
+            default=existing_translation,
+            placeholder="Type official manual translation here, or leave empty to delete…",
+        )
+        self.add_item(self.translation_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_text = self.translation_input.value.strip()
+        name, flag = LANG_BY_CODE.get(self.lang_code, (self.lang_code, "🌐"))
+
+        if not new_text:
+            run_db(
+                "DELETE FROM translations WHERE message_id = ? AND lang = ? AND manual = 1",
+                (self.message_id, self.lang_code),
+            )
+            await interaction.response.send_message(
+                f"🗑️ Removed official translation for **{flag} {name}**. Future requests will generate AI translations on demand.",
+                ephemeral=True,
+            )
+            if interaction.guild:
+                msg_link = f"https://discord.com/channels/{interaction.guild_id}/{interaction.channel_id}/{self.message_id}"
+                await send_log(
+                    interaction.guild,
+                    "🗑️ Official translation removed",
+                    f"**Language:** {flag} {name} (`{self.lang_code}`)\n"
+                    f"**Announcement:** [Jump to Message]({msg_link})\n"
+                    f"**By:** {interaction.user.mention}",
+                    color=0xED4245,
+                )
+            return
+
+        now_ts = int(time.time())
+        run_db(
+            "INSERT INTO translations (message_id, lang, translation, glossary_hash, created_at, manual) "
+            "VALUES (?, ?, ?, '', ?, 1) "
+            "ON CONFLICT(message_id, lang) DO UPDATE SET translation = excluded.translation, "
+            "manual = 1, created_at = excluded.created_at",
+            (self.message_id, self.lang_code, new_text, now_ts),
+        )
+        await interaction.response.send_message(
+            f"✅ Saved official translation for **{flag} {name}**! It will be served instantly to all members with zero API token cost.",
+            ephemeral=True,
+        )
+        if interaction.guild:
+            msg_link = f"https://discord.com/channels/{interaction.guild_id}/{interaction.channel_id}/{self.message_id}"
+            prev = preview(new_text, 200)
+            await send_log(
+                interaction.guild,
+                "📌 Official translation set",
+                f"**Language:** {flag} {name} (`{self.lang_code}`)\n"
+                f"**Announcement:** [Jump to Message]({msg_link})\n"
+                f"**Preview:** {prev}\n"
+                f"**By:** {interaction.user.mention}",
+                color=0x57F287,
+            )
+
+
+@bot.tree.context_menu(name="Set official translation")
+@app_commands.guild_only()
+async def context_set_official_translation(interaction: discord.Interaction, message: discord.Message):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "Only server managers and administrators can set official translations.", ephemeral=True
+        )
+        return
+
+    rows = run_db(
+        "SELECT text, languages, source_lang FROM announcements WHERE message_id = ?",
+        (message.id,),
+    )
+    if not rows:
+        await interaction.response.send_message(
+            "This command only works on announcements posted by Griedon Translator.", ephemeral=True
+        )
+        return
+
+    text, langs_json, source_lang = rows[0]
+    offered = json.loads(langs_json)
+    if not offered:
+        await interaction.response.send_message("No offered languages found for this announcement.", ephemeral=True)
+        return
+
+    view = ChooseOfficialLangView(message.id, offered)
+    await interaction.response.send_message(
+        "Select the language you want to set or remove an official manual translation for:",
+        view=view,
+        ephemeral=True,
+    )
+
+
+# ---------- Mini 7: Edit and delete announcements ----------
+class EditAnnouncementModal(discord.ui.Modal, title="Edit announcement"):
+    new_text = discord.ui.TextInput(
+        label="Announcement Text",
+        style=discord.TextStyle.paragraph,
+        max_length=2000,
+        required=True,
+    )
+
+    def __init__(self, message: discord.Message, current_text: str):
+        super().__init__()
+        self.message = message
+        self.new_text.default = current_text
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        updated_text = self.new_text.value.strip()
+
+        rows = run_db(
+            "SELECT languages, source_lang, link_buttons, ping_role_id FROM announcements WHERE message_id = ?",
+            (self.message.id,),
+        )
+        if not rows:
+            await interaction.followup.send("Could not find announcement record in the database.", ephemeral=True)
+            return
+
+        langs_json, old_source, link_buttons_json, ping_role_id = rows[0]
+        offered = json.loads(langs_json)
+        link_buttons = parse_link_buttons(link_buttons_json)
+
+        new_source = await detect_language(updated_text)
+
+        new_codes = [c for c in offered if c != new_source]
+        if not new_codes:
+            new_codes = offered
+
+        new_view = TranslateView(new_codes, link_buttons)
+
+        new_content = updated_text
+        if ping_role_id:
+            new_content = f"<@&{ping_role_id}>\n{updated_text}"
+
+        try:
+            await self.message.edit(content=new_content, view=new_view)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to edit Discord message: {e}", ephemeral=True)
+            return
+
+        run_db(
+            "UPDATE announcements SET text = ?, source_lang = ? WHERE message_id = ?",
+            (updated_text, new_source, self.message.id),
+        )
+
+        # Clear cached AI translations
+        run_db("DELETE FROM translations WHERE message_id = ? AND (manual = 0 OR manual IS NULL)", (self.message.id,))
+
+        # Delete old official manual translations and report affected languages
+        manual_rows = run_db("SELECT lang FROM translations WHERE message_id = ? AND manual = 1", (self.message.id,))
+        affected_manual = [r[0] for r in manual_rows]
+        if affected_manual:
+            run_db("DELETE FROM translations WHERE message_id = ? AND manual = 1", (self.message.id,))
+
+        manual_note = ""
+        if affected_manual:
+            names = [f"{LANG_BY_CODE.get(l, (l, ''))[1]} {LANG_BY_CODE.get(l, (l, ''))[0]}" for l in affected_manual]
+            manual_note = "\n⚠️ **Old official translations removed:** " + ", ".join(names)
+
+        await interaction.followup.send(
+            f"✅ **Announcement updated!** Cached translations have been cleared.{manual_note}",
+            ephemeral=True,
+        )
+
+        if interaction.guild:
+            msg_link = f"https://discord.com/channels/{interaction.guild_id}/{interaction.channel_id}/{self.message.id}"
+            prev = preview(updated_text, 200)
+            await send_log(
+                interaction.guild,
+                "✏️ Announcement edited",
+                f"**Announcement:** [Jump to Message]({msg_link})\n"
+                f"**New Source Language:** {LANG_BY_CODE.get(new_source, (new_source, ''))[0]}\n"
+                f"**Preview:** {prev}\n"
+                f"**By:** {interaction.user.mention}{manual_note}",
+                color=0x5865F2,
+            )
+
+
+@bot.tree.context_menu(name="Edit announcement")
+@app_commands.guild_only()
+async def context_edit_announcement(interaction: discord.Interaction, message: discord.Message):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "Only server managers and administrators can edit announcements.", ephemeral=True
+        )
+        return
+
+    rows = run_db(
+        "SELECT text FROM announcements WHERE message_id = ?",
+        (message.id,),
+    )
+    if not rows:
+        await interaction.response.send_message(
+            "This command only works on announcements posted by Griedon Translator.", ephemeral=True
+        )
+        return
+
+    current_text = rows[0][0]
+    modal = EditAnnouncementModal(message, current_text)
+    await interaction.response.send_modal(modal)
+
+
+class DeleteAnnouncementConfirmationView(discord.ui.View):
+    def __init__(self, message: discord.Message):
+        super().__init__(timeout=60)
+        self.message = message
+
+    @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        msg_id = self.message.id
+        guild = interaction.guild
+
+        try:
+            await self.message.delete()
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to delete message from Discord: {e}", ephemeral=True)
+            return
+
+        run_db("DELETE FROM translations WHERE message_id = ?", (msg_id,))
+        run_db("DELETE FROM announcements WHERE message_id = ?", (msg_id,))
+
+        self.stop()
+        await interaction.response.edit_message(
+            content="🗑️ **Announcement and all cached translations deleted.**",
+            view=None,
+        )
+
+        if guild:
+            await send_log(
+                guild,
+                "🗑️ Announcement deleted",
+                f"**Message ID:** `{msg_id}`\n**By:** {interaction.user.mention}",
+                color=0xED4245,
+            )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="Deletion cancelled.", view=None)
+
+
+@bot.tree.context_menu(name="Delete announcement")
+@app_commands.guild_only()
+async def context_delete_announcement(interaction: discord.Interaction, message: discord.Message):
+    if not can_send(interaction):
+        await interaction.response.send_message(
+            "Only server managers and administrators can delete announcements.", ephemeral=True
+        )
+        return
+
+    rows = run_db(
+        "SELECT text FROM announcements WHERE message_id = ?",
+        (message.id,),
+    )
+    if not rows:
+        await interaction.response.send_message(
+            "This command only works on announcements posted by Griedon Translator.", ephemeral=True
+        )
+        return
+
+    view = DeleteAnnouncementConfirmationView(message)
+    await interaction.response.send_message(
+        "⚠️ Are you sure you want to permanently delete this announcement and all its translations?",
+        view=view,
+        ephemeral=True,
+    )
+
+
+# ---------- Mini 3: /privacy command ----------
+@bot.tree.command(name="privacy", description="View data storage, privacy policy, and third-party AI processing details")
+async def privacy_command(interaction: discord.Interaction):
+    support_str = f"\n• **Support Server:** {SUPPORT_URL}" if SUPPORT_URL else ""
+    privacy_target = PRIVACY_URL if PRIVACY_URL else f"Available in our [Support Server]({SUPPORT_URL})"
+    terms_target = TERMS_URL if TERMS_URL else f"Available in our [Support Server]({SUPPORT_URL})"
+
+    text = (
+        "**🔒 Griedon Translator: Privacy & Data Lifecycle**\n\n"
+        "**1. What is stored?**\n"
+        "• **Your Language Preference:** If you run `/mylanguage`, your chosen language code is stored with your Discord User ID.\n"
+        "• **Announcements & Translations:** Announcement text and cached translations are stored for fast delivery and bandwidth savings.\n"
+        "• **Server Settings & Usage:** Configured manager roles, default languages, tone, log channels, and anonymous daily translation counts.\n\n"
+        "**2. What is sent to third parties?**\n"
+        "• When a translation or phrase explanation is requested, the text is processed securely by **OpenAI** and/or **Google Gemini**.\n"
+        "• **No personal identifiers** (no Discord Usernames, User IDs, avatar links, or server member lists) are ever sent to AI providers.\n\n"
+        "**3. How to delete your data:**\n"
+        "• Run **`/mylanguage reset:True`** at any time to instantly and permanently erase your saved language preference.\n"
+        "• Removing or kicking the bot from a server instantly purges all server settings, cached announcements, and translations for that server.\n\n"
+        f"**4. Data Retention:**\n"
+        f"• Announcements and translations are automatically cleaned up after **{RETENTION_DAYS} days**.\n"
+        "• Finished scheduled announcements are purged after **30 days**.\n"
+        "• Server aggregate usage counts are purged after **400 days**.\n\n"
+        f"• **Privacy Policy:** {privacy_target}\n"
+        f"• **Terms of Service:** {terms_target}"
+        f"{support_str}"
+    )
+    await interaction.response.send_message(text, ephemeral=True)
 
 
 # ---------- database migration command (Update 9) ----------
